@@ -1,0 +1,8 @@
+# 向量库缓存
+chroma_db/
+# API密钥配置
+.env
+__pycache__/
+*.pyc
+*.pdf
+*.log
