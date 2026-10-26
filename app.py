@@ -217,7 +217,7 @@ with tabs[0]:
             st.markdown(record["answer"])
             show_sources(record["sources"], int(record["id"]))
 
-    question = st.chat_input("例如：本科生申请缓考需要哪些材料和步骤？")
+    question = st.chat_input("请输入要查询的教务制度、办理条件或流程")
     if question:
         try:
             with st.spinner("正在权限范围内检索并生成回答……"):

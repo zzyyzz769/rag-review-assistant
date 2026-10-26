@@ -58,6 +58,20 @@ QUERY_EXPANSIONS = {
     "选课": "选课 退课 补选 学分",
     "成绩": "成绩 查询 复核 绩点 学分",
 }
+CORE_SYNONYMS = {
+    "缓考": ("缓考", "延期考试", "延缓考试"),
+    "补考": ("补考",),
+    "重修": ("重修",),
+    "休学": ("休学",),
+    "复学": ("复学",),
+    "退学": ("退学",),
+    "转专业": ("转专业", "调整专业"),
+    "奖学金": ("奖学金",),
+    "助学金": ("助学金",),
+    "请假": ("请假",),
+    "选课": ("选课",),
+    "成绩": ("成绩",),
+}
 STOPWORDS = {
     "什么", "怎么", "如何", "需要", "可以", "请问", "一下", "知道", "告诉我",
     "本科生", "学生", "学校", "相关", "规定", "办理", "申请", "的", "了", "吗",
@@ -495,7 +509,6 @@ class CampusRAG:
             f"{metadata.get('page')}/{metadata.get('chunk')}"
         )
 
-    @staticmethod
     def _evidence(doc: Document, question: str) -> tuple[str, str, list[str]]:
         """从切片中抽取最关键的 1～2 句，而不是把整段交给用户阅读。"""
         text = re.sub(r"[ \t]+", " ", doc.page_content.strip())
@@ -508,11 +521,16 @@ class CampusRAG:
             sentences = [text]
         query_tokens = set(self._tokens(question))
         core_terms = [key for key in QUERY_EXPANSIONS if key in question]
+        search_terms = {
+            synonym
+            for term in core_terms
+            for synonym in CORE_SYNONYMS.get(term, (term,))
+        }
 
         def score(sentence: str) -> int:
             compact = re.sub(r"\s+", "", sentence)
             value = sum(3 if len(token) > 2 else 2 for token in query_tokens if token in compact)
-            value += sum(8 for term in core_terms if term in compact)
+            value += sum(8 for term in search_terms if term in compact)
             return value
 
         best_index = max(range(len(sentences)), key=lambda i: score(sentences[i]))
@@ -531,7 +549,7 @@ class CampusRAG:
         compact_text = re.sub(r"\s+", "", text)
         matched = sorted(
             {token for token in query_tokens if token in compact_text} |
-            {term for term in core_terms if term in compact_text}
+            {term for term in search_terms if term in compact_text}
         )
         return evidence, sentences[best_index], matched[:6]
 
@@ -579,16 +597,28 @@ class CampusRAG:
         candidates = list(merged.values())
         core_terms = [key for key in QUERY_EXPANSIONS if key in question]
         if core_terms:
-            # 对“缓考、休学”等明确事项，只保留直接出现该事项的证据。
-            candidates = [
-                entry for entry in candidates
-                if any(
-                    term in re.sub(r"\s+", "", entry["doc"].page_content)
-                    for term in core_terms
-                )
-            ]
-            for entry in candidates:
-                entry["rrf"] += 0.04
+            # 不依赖向量/BM25 是否召回，再对全部已入库切片做一次原文核查。
+            search_terms = {
+                synonym
+                for term in core_terms
+                for synonym in CORE_SYNONYMS.get(term, (term,))
+            }
+            direct_entries: dict[str, dict[str, Any]] = {}
+            for group in allowed:
+                for doc in self._group_chunks(group):
+                    compact = re.sub(r"\s+", "", doc.page_content)
+                    if not any(term in compact for term in search_terms):
+                        continue
+                    key = self._doc_key(doc)
+                    entry = merged.setdefault(key, {
+                        "doc": doc,
+                        "rrf": 0.0,
+                        "keyword_score": 0.0,
+                        "vector_distance": None,
+                    })
+                    entry["rrf"] += 0.04
+                    direct_entries[key] = entry
+            candidates = list(direct_entries.values())
         else:
             # 有关键词命中时，不再拿纯向量结果凑满来源数量。
             keyword_hits = [entry for entry in candidates if entry["keyword_score"] > 0]
