@@ -8,6 +8,7 @@ import json
 import re
 import secrets
 import sqlite3
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from docx import Document as WordDocument
 import jieba
 from rank_bm25 import BM25Okapi
+from pypdf import PdfReader
 
 
 SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".docx"}
@@ -91,6 +93,7 @@ class CampusRAG:
         ollama_base_url: str = "http://localhost:11434",
         chunk_size: int = 500,
         chunk_overlap: int = 80,
+        reranker_model: str = "BAAI/bge-reranker-base",
     ) -> None:
         self.data_dir = Path(data_dir)
         self.db_dir = Path(db_dir)
@@ -105,6 +108,9 @@ class CampusRAG:
         self._vectorstores: dict[str, Chroma] = {}
         self._chunk_cache: dict[str, list[Document]] = {}
         self._bm25_cache: dict[str, tuple[BM25Okapi, list[list[str]]]] = {}
+        self.llm_model = llm_model
+        self.reranker_model = reranker_model
+        self._reranker: Any = None
         self.embeddings = OllamaEmbeddings(model=embedding_model, base_url=ollama_base_url)
         self.llm = OllamaLLM(model=llm_model, base_url=ollama_base_url, temperature=0.1)
         self.splitter = RecursiveCharacterTextSplitter(
@@ -195,7 +201,21 @@ class CampusRAG:
                     role TEXT NOT NULL,
                     question TEXT NOT NULL,
                     answer TEXT NOT NULL,
-                    sources_json TEXT NOT NULL
+                    sources_json TEXT NOT NULL,
+                    confidence INTEGER NOT NULL DEFAULT 0,
+                    model TEXT NOT NULL DEFAULT '',
+                    retrieval_mode TEXT NOT NULL DEFAULT 'hybrid',
+                    feedback TEXT NOT NULL DEFAULT '',
+                    feedback_at TEXT,
+                    rerank_used INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS document_checks (
+                    group_name TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    sensitive_count INTEGER NOT NULL DEFAULT 0,
+                    warning TEXT NOT NULL DEFAULT '',
+                    checked_at TEXT NOT NULL,
+                    PRIMARY KEY (group_name, filename)
                 );
                 CREATE INDEX IF NOT EXISTS idx_audit_role
                     ON audit_logs(role, created_at);
@@ -203,6 +223,21 @@ class CampusRAG:
                     ON qa_records(username, created_at);
                 """
             )
+
+        # 老版本数据库原地升级，不清空历史问答。
+        with self._connect() as conn:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(qa_records)")}
+            additions = {
+                "confidence": "INTEGER NOT NULL DEFAULT 0",
+                "model": "TEXT NOT NULL DEFAULT ''",
+                "retrieval_mode": "TEXT NOT NULL DEFAULT 'hybrid'",
+                "feedback": "TEXT NOT NULL DEFAULT ''",
+                "feedback_at": "TEXT",
+                "rerank_used": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE qa_records ADD COLUMN {name} {definition}")
 
         # 仅首次运行创建演示账户；修改密码后不会被覆盖。
         defaults = (
@@ -329,6 +364,92 @@ class CampusRAG:
                     lines.append(" | ".join(cells))
         return "\n".join(lines).strip()
 
+    @staticmethod
+    def _mask_sensitive(text: str) -> str:
+        text = re.sub(r"(?<!\d)(1[3-9]\d)\d{4}(\d{4})(?!\d)", r"\1****\2", text)
+        text = re.sub(r"(?<!\d)(\d{6})\d{8}(\d{3}[0-9Xx])(?!\d)", r"\1********\2", text)
+        text = re.sub(r"((?:学号|学生号)\s*[:：]?\s*)\d{6,20}", r"\1[已脱敏]", text)
+        return text
+
+    def preflight_document(
+        self, actor: dict[str, str], group: str, filename: str, content: bytes
+    ) -> dict[str, Any]:
+        """上传前检查可读性、加密、扫描 PDF 与常见敏感信息。"""
+        self._require_admin(actor)
+        filename = self._safe_filename(filename)
+        suffix = Path(filename).suffix.lower()
+        warnings: list[str] = []
+        encrypted = False
+        scanned = False
+        fatal = False
+        text = ""
+        try:
+            if suffix == ".pdf":
+                reader = PdfReader(io.BytesIO(content))
+                encrypted = bool(reader.is_encrypted)
+                if encrypted:
+                    warnings.append("PDF 已加密，请先解除密码保护")
+                else:
+                    page_texts = [(page.extract_text() or "").strip() for page in reader.pages]
+                    text = "\n".join(page_texts)
+                    if not reader.pages or len(text.strip()) < max(20, len(reader.pages) * 10):
+                        scanned = True
+                        warnings.append("疑似扫描/图片型 PDF，当前无法有效提取文字，请先 OCR")
+            elif suffix == ".docx":
+                if not zipfile.is_zipfile(io.BytesIO(content)):
+                    encrypted = True
+                    warnings.append("DOCX 无法读取，可能已加密或实际是旧版 DOC")
+                else:
+                    word = WordDocument(io.BytesIO(content))
+                    lines = [p.text.strip() for p in word.paragraphs if p.text.strip()]
+                    for table in word.tables:
+                        for row in table.rows:
+                            lines.append(" | ".join(cell.text.strip() for cell in row.cells))
+                    text = "\n".join(lines)
+            else:
+                raw = content
+                for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+                    try:
+                        text = raw.decode(encoding)
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                else:
+                    text = raw.decode("utf-8", errors="replace")
+        except Exception as exc:
+            fatal = True
+            warnings.append(f"文件预检失败：{exc}")
+
+        if not encrypted and not scanned and not text.strip():
+            fatal = True
+            warnings.append("未检测到可读取文字")
+        sensitive_counts = {
+            "手机号": len(re.findall(r"(?<!\d)1[3-9]\d{9}(?!\d)", text)),
+            "身份证号": len(re.findall(r"(?<!\d)\d{17}[0-9Xx](?!\d)", text)),
+            "学号": len(re.findall(r"(?:学号|学生号)\s*[:：]?\s*\d{6,20}", text)),
+        }
+        sensitive_count = sum(sensitive_counts.values())
+        if sensitive_count:
+            warnings.append(f"检测到 {sensitive_count} 处潜在敏感信息，请确认是否允许入库")
+        ok = not fatal and not encrypted and not scanned
+        warning = "；".join(warnings)
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO document_checks"
+                " (group_name, filename, sensitive_count, warning, checked_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (group, filename, sensitive_count, warning, self._now()),
+            )
+        return {
+            "ok": ok,
+            "warning": warning,
+            "encrypted": encrypted,
+            "scanned": scanned,
+            "sensitive_count": sensitive_count,
+            "sensitive_counts": sensitive_counts,
+            "char_count": len(text.strip()),
+        }
+
     def _load_file(self, group: str, filename: str) -> list[Document]:
         path = self._path(group, filename)
         if not path.is_file():
@@ -419,6 +540,11 @@ class CampusRAG:
         path.unlink(missing_ok=True)
         self._chunk_cache.pop(group, None)
         self._bm25_cache.pop(group, None)
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM document_checks WHERE group_name = ? AND filename = ?",
+                (group, path.name),
+            )
         self._audit(
             actor["username"], actor["role"], "delete_document", f"{group}/{path.name}"
         )
@@ -446,6 +572,27 @@ class CampusRAG:
             int(self._vectorstore(group)._collection.count())
             for group in self._allowed_groups(actor)
         )
+
+    def get_stats(self, actor: dict[str, str]) -> dict[str, int]:
+        groups = self._allowed_groups(actor)
+        placeholders = ",".join("?" for _ in groups)
+        with self._connect() as conn:
+            sensitive = conn.execute(
+                f"SELECT COALESCE(SUM(sensitive_count), 0) FROM document_checks"
+                f" WHERE group_name IN ({placeholders})",
+                groups,
+            ).fetchone()[0]
+            today = datetime.now().astimezone().date().isoformat()
+            today_qa = conn.execute(
+                "SELECT COUNT(*) FROM qa_records WHERE username = ? AND created_at >= ?",
+                (actor["username"], today),
+            ).fetchone()[0]
+        return {
+            "documents": len(self.list_documents(actor)),
+            "chunks": self.accessible_chunk_count(actor),
+            "sensitive_hits": int(sensitive),
+            "today_qa": int(today_qa),
+        }
 
     # ---------- 检索、问答与原文 ----------
 
@@ -553,26 +700,49 @@ class CampusRAG:
         )
         return evidence, sentences[best_index], matched[:6]
 
-    def ask(self, actor: dict[str, str], question: str, top_k: int = 4) -> dict[str, Any]:
+    def _rerank(
+        self, question: str, entries: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """可选的本地 CrossEncoder 重排，首次使用需下载模型。"""
+        if not entries:
+            return entries
+        if self._reranker is None:
+            try:
+                from sentence_transformers import CrossEncoder
+            except ImportError as exc:
+                raise RuntimeError(
+                    "启用 Rerank 需要安装 sentence-transformers。"
+                ) from exc
+            self._reranker = CrossEncoder(self.reranker_model, device="cpu")
+        pairs = [[question, entry["doc"].page_content] for entry in entries]
+        scores = self._reranker.predict(pairs)
+        for entry, score in zip(entries, scores):
+            entry["rerank_score"] = float(score)
+        return sorted(entries, key=lambda item: item["rerank_score"], reverse=True)
+
+    def ask(
+        self,
+        actor: dict[str, str],
+        question: str,
+        top_k: int = 4,
+        retrieval_mode: str = "hybrid",
+        use_rerank: bool = False,
+    ) -> dict[str, Any]:
         allowed = self._allowed_groups(actor)
         question = question.strip()
         if not question:
             raise ValueError("问题不能为空。")
+        if retrieval_mode not in {"vector", "bm25", "hybrid"}:
+            raise ValueError("未知检索模式。")
         top_k = max(1, min(int(top_k), 6))
         candidate_limit = max(12, top_k * 4)
-
-        # RRF 融合中文 BM25 与向量检索；关键词略高权重，减少“相似但无关”。
         merged: dict[str, dict[str, Any]] = {}
 
-        def add_candidate(
-            doc: Document, rank: int, channel: str, score: float
-        ) -> None:
+        def add_candidate(doc: Document, rank: int, channel: str, score: float) -> None:
             key = self._doc_key(doc)
             entry = merged.setdefault(key, {
-                "doc": doc,
-                "rrf": 0.0,
-                "keyword_score": 0.0,
-                "vector_distance": None,
+                "doc": doc, "rrf": 0.0, "keyword_score": 0.0,
+                "vector_distance": None, "rerank_score": None,
             })
             weight = 1.35 if channel == "keyword" else 1.0
             entry["rrf"] += weight / (60 + rank + 1)
@@ -583,50 +753,59 @@ class CampusRAG:
 
         expanded_query = self._expanded_query(question)
         for group in allowed:
-            vector_results = self._vectorstore(group).similarity_search_with_score(
-                expanded_query, k=candidate_limit
-            )
-            for rank, (doc, distance) in enumerate(vector_results):
-                if doc.metadata.get("group") == group:
-                    add_candidate(doc, rank, "vector", float(distance))
-            for rank, (doc, score) in enumerate(
-                self._keyword_candidates(group, question, candidate_limit)
-            ):
-                add_candidate(doc, rank, "keyword", score)
+            if retrieval_mode in {"vector", "hybrid"}:
+                vector_results = self._vectorstore(group).similarity_search_with_score(
+                    expanded_query, k=candidate_limit
+                )
+                for rank, (doc, distance) in enumerate(vector_results):
+                    if doc.metadata.get("group") == group:
+                        add_candidate(doc, rank, "vector", float(distance))
+            if retrieval_mode in {"bm25", "hybrid"}:
+                for rank, (doc, score) in enumerate(
+                    self._keyword_candidates(group, question, candidate_limit)
+                ):
+                    add_candidate(doc, rank, "keyword", score)
 
         candidates = list(merged.values())
         core_terms = [key for key in QUERY_EXPANSIONS if key in question]
         if core_terms:
-            # 不依赖向量/BM25 是否召回，再对全部已入库切片做一次原文核查。
             search_terms = {
-                synonym
-                for term in core_terms
+                synonym for term in core_terms
                 for synonym in CORE_SYNONYMS.get(term, (term,))
             }
-            direct_entries: dict[str, dict[str, Any]] = {}
-            for group in allowed:
-                for doc in self._group_chunks(group):
-                    compact = re.sub(r"\s+", "", doc.page_content)
-                    if not any(term in compact for term in search_terms):
-                        continue
-                    key = self._doc_key(doc)
-                    entry = merged.setdefault(key, {
-                        "doc": doc,
-                        "rrf": 0.0,
-                        "keyword_score": 0.0,
-                        "vector_distance": None,
-                    })
-                    entry["rrf"] += 0.04
-                    direct_entries[key] = entry
-            candidates = list(direct_entries.values())
-        else:
-            # 有关键词命中时，不再拿纯向量结果凑满来源数量。
+            if retrieval_mode == "hybrid":
+                # 混合模式补充全库直接核查，避免双路召回共同漏掉相关页。
+                direct_entries: dict[str, dict[str, Any]] = {}
+                for group in allowed:
+                    for doc in self._group_chunks(group):
+                        compact = re.sub(r"\s+", "", doc.page_content)
+                        if not any(term in compact for term in search_terms):
+                            continue
+                        key = self._doc_key(doc)
+                        entry = merged.setdefault(key, {
+                            "doc": doc, "rrf": 0.0, "keyword_score": 0.0,
+                            "vector_distance": None, "rerank_score": None,
+                        })
+                        entry["rrf"] += 0.04
+                        direct_entries[key] = entry
+                candidates = list(direct_entries.values())
+            else:
+                candidates = [
+                    entry for entry in candidates
+                    if any(term in re.sub(r"\s+", "", entry["doc"].page_content)
+                           for term in search_terms)
+                ]
+        elif retrieval_mode != "vector":
             keyword_hits = [entry for entry in candidates if entry["keyword_score"] > 0]
             if keyword_hits:
                 candidates = keyword_hits
 
         candidates.sort(key=lambda entry: entry["rrf"], reverse=True)
-        selected = []
+        if use_rerank and candidates:
+            candidates = self._rerank(question, candidates[:30])
+
+        max_bm25 = max((entry["keyword_score"] for entry in candidates), default=0.0)
+        selected_entries = []
         seen_pages = set()
         for entry in candidates:
             doc = entry["doc"]
@@ -635,22 +814,33 @@ class CampusRAG:
             if page_key in seen_pages:
                 continue
             seen_pages.add(page_key)
-            selected.append(doc)
-            if len(selected) >= top_k:
+            bm25_norm = entry["keyword_score"] / max_bm25 if max_bm25 > 0 else 0.0
+            distance = entry["vector_distance"]
+            vector_similarity = 1.0 / (1.0 + max(distance, 0.0)) if distance is not None else 0.0
+            if retrieval_mode == "bm25":
+                source_confidence = 100.0 * bm25_norm
+            elif retrieval_mode == "vector":
+                source_confidence = 100.0 * vector_similarity
+            else:
+                source_confidence = 100.0 * (0.55 * bm25_norm + 0.45 * vector_similarity)
+            entry["confidence"] = max(0, min(100, round(source_confidence)))
+            selected_entries.append(entry)
+            if len(selected_entries) >= top_k:
                 break
 
-        if not selected:
+        if not selected_entries:
             topic = "、".join(core_terms) if core_terms else question
             answer = (
                 f"未在当前权限范围内的文档中找到与“{topic}”直接相关的规定。"
-                "为避免误导，本次不附无关来源。请补充包含该事项的教务制度，"
-                "或换用文件中的原文表述再查询。"
+                "为避免误导，本次不附无关来源。请补充相关制度或换用原文表述。"
             )
             sources: list[dict[str, Any]] = []
+            confidence = 0
         else:
             blocks = []
             sources = []
-            for index, doc in enumerate(selected, start=1):
+            for index, entry in enumerate(selected_entries, start=1):
+                doc = entry["doc"]
                 page = doc.metadata.get("page")
                 location = f"，第 {page} 页" if page else ""
                 group = str(doc.metadata["group"])
@@ -658,22 +848,16 @@ class CampusRAG:
                 label = f"{GROUPS[group]}/{doc.metadata['source']}{location}"
                 blocks.append(f"[资料{index}] 来源：{label}\n{doc.page_content.strip()}")
                 sources.append({
-                    "id": index,
-                    "group": group,
-                    "group_name": GROUPS[group],
-                    "source": doc.metadata["source"],
-                    "page": page,
-                    "chunk": doc.metadata.get("chunk"),
-                    "content": doc.page_content.strip(),
-                    "evidence": evidence,
-                    "highlight": highlight,
-                    "matched": matched,
+                    "id": index, "group": group, "group_name": GROUPS[group],
+                    "source": doc.metadata["source"], "page": page,
+                    "chunk": doc.metadata.get("chunk"), "content": doc.page_content.strip(),
+                    "evidence": evidence, "highlight": highlight, "matched": matched,
+                    "confidence": entry["confidence"],
                 })
-
             prompt = f"""你是“校务通”校园教务问答助手。目标是直接解决用户问题，而不是堆砌资料。
 1. 只使用与问题直接相关的资料，忽略其他资料，不得用相近制度替代原问题。
 2. 第一行先给明确结论；随后用不超过4条短句列出条件、材料或步骤，并标注[资料1]等编号。
-3. 如果资料只提到该事项但没有所需条件或流程，直接说明“资料仅提到该事项，未写明具体条件/材料/流程”，不要泛泛回答。
+3. 如果资料只提到该事项但没有所需条件或流程，直接说明缺少哪类信息。
 4. 不得编造条款、日期、部门、材料或流程，不复述这些指令。
 
 用户问题：{question}
@@ -682,21 +866,30 @@ class CampusRAG:
 {chr(10).join(blocks)}
 """
             answer = str(self.llm.invoke(prompt)).strip()
+            values = [entry["confidence"] for entry in selected_entries]
+            confidence = round(0.6 * max(values) + 0.4 * sum(values) / len(values))
 
         sources_json = json.dumps(sources, ensure_ascii=False)
         with self._connect() as conn:
             cursor = conn.execute(
-                "INSERT INTO qa_records (created_at, username, role, question, answer, sources_json)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (self._now(), actor["username"], actor["role"], question, answer, sources_json),
+                "INSERT INTO qa_records (created_at, username, role, question, answer,"
+                " sources_json, confidence, model, retrieval_mode, rerank_used)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (self._now(), actor["username"], actor["role"], question, answer,
+                 sources_json, confidence, self.llm_model, retrieval_mode, int(use_rerank)),
             )
             record_id = int(cursor.lastrowid)
         self._audit(
-            actor["username"], actor["role"], "hybrid_query", ",".join(allowed),
-            f"问题：{question[:500]}；命中："
+            actor["username"], actor["role"], "query", ",".join(allowed),
+            f"问题：{question[:500]}；模式：{retrieval_mode}；Rerank：{use_rerank}；"
+            f"置信度：{confidence}；命中："
             + "；".join(f"{s['group']}/{s['source']}" for s in sources),
         )
-        return {"answer": answer, "sources": sources, "record_id": record_id}
+        return {
+            "answer": answer, "sources": sources, "record_id": record_id,
+            "confidence": confidence, "model": self.llm_model,
+            "retrieval_mode": retrieval_mode, "rerank_used": use_rerank,
+        }
 
     def open_source(
         self,
@@ -742,14 +935,43 @@ class CampusRAG:
                 "question": row["question"],
                 "answer": row["answer"],
                 "sources": json.loads(row["sources_json"]),
+                "confidence": int(row["confidence"]),
+                "model": row["model"],
+                "retrieval_mode": row["retrieval_mode"],
+                "rerank_used": bool(row["rerank_used"]),
+                "feedback": row["feedback"],
+                "feedback_at": row["feedback_at"],
             })
         return records
+
+    def set_feedback(self, actor: dict[str, str], record_id: int, feedback: str) -> None:
+        self._role(actor)
+        if feedback not in {"useful", "useless"}:
+            raise ValueError("未知反馈类型。")
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE qa_records SET feedback = ?, feedback_at = ?"
+                " WHERE id = ? AND username = ?",
+                (feedback, self._now(), record_id, actor["username"]),
+            )
+        if cursor.rowcount == 0:
+            raise PermissionError("只能评价自己的问答记录。")
+        self._audit(
+            actor["username"], actor["role"], "answer_feedback",
+            str(record_id), "有用" if feedback == "useful" else "无用",
+        )
 
     @staticmethod
     def _csv_safe(value: Any) -> str:
         """避免用户文本在 Excel 中被当作公式执行。"""
         text = str(value)
         return "'" + text if text.lstrip().startswith(("=", "+", "-", "@")) else text
+
+    @staticmethod
+    def _watermark(username: str) -> str:
+        """将当前用户 ID 编码为零宽字符，附加到导出内容中用于溯源。"""
+        bits = "".join(f"{byte:08b}" for byte in username.encode("utf-8"))
+        return "\u2063" + "".join("\u200b" if bit == "0" else "\u200c" for bit in bits) + "\u2063"
 
     def export_qa_csv(self, actor: dict[str, str]) -> bytes:
         self._role(actor)
@@ -760,7 +982,10 @@ class CampusRAG:
             ).fetchall()
         output = io.StringIO(newline="")
         writer = csv.writer(output)
-        writer.writerow(["时间", "用户名", "角色", "问题", "回答", "原文来源"])
+        writer.writerow([
+            "时间", "用户名", "角色", "问题", "回答", "置信度",
+            "模型", "检索模式", "Rerank", "反馈", "原文来源",
+        ])
         for row in rows:
             sources = json.loads(row["sources_json"])
             source_text = "\n".join(
@@ -773,7 +998,9 @@ class CampusRAG:
                 self._csv_safe(value) for value in (
                     row["created_at"], row["username"],
                     ROLE_NAMES.get(row["role"], row["role"]),
-                    row["question"], row["answer"], source_text,
+                    row["question"], row["answer"] + self._watermark(actor["username"]),
+                    row["confidence"], row["model"], row["retrieval_mode"],
+                    "是" if row["rerank_used"] else "否", row["feedback"], source_text,
                 )
             ])
         self._audit(actor["username"], actor["role"], "export_qa_csv", detail=f"{len(rows)} 条")
@@ -795,3 +1022,37 @@ class CampusRAG:
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
+
+
+    @staticmethod
+    def _mask_username(username: str) -> str:
+        if not username:
+            return "***"
+        if len(username) == 1:
+            return username[0] + "***"
+        return username[0] + "***" + username[-1]
+
+    def export_audit_csv(self, actor: dict[str, str]) -> bytes:
+        """管理员导出脱敏审计日志，并嵌入当前管理员 ID 水印。"""
+        self._require_admin(actor)
+        rows = list(reversed(self.get_audit_logs(actor, limit=1000)))
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        writer.writerow([
+            "脱敏标记", "访问时间", "用户ID（脱敏）", "访问角色",
+            "操作", "命中文档/资源", "详情（脱敏）",
+        ])
+        for row in rows:
+            detail = self._mask_sensitive(row["detail"]) + self._watermark(actor["username"])
+            writer.writerow([
+                self._csv_safe(value) for value in (
+                    "已脱敏", row["created_at"], self._mask_username(row["username"]),
+                    ROLE_NAMES.get(row["role"], row["role"]), row["action"],
+                    self._mask_sensitive(row["resource"]), detail,
+                )
+            ])
+        self._audit(
+            actor["username"], actor["role"], "export_audit_csv",
+            detail=f"导出 {len(rows)} 条，已脱敏并嵌入水印",
+        )
+        return output.getvalue().encode("utf-8-sig")

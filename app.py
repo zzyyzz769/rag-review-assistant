@@ -1,5 +1,6 @@
 """校务通 Streamlit 前端。启动：python -m streamlit run app.py"""
 
+import hashlib
 import html
 
 import streamlit as st
@@ -85,17 +86,39 @@ with st.sidebar:
     st.caption(f"当前可访问：{allowed_names}")
 
     with st.expander("本地模型设置"):
-        llm_model = st.text_input("Qwen 生成模型", value="qwen2.5:3b")
+        llm_model = st.selectbox(
+            "Qwen 生成模型",
+            ["qwen:1.8b", "qwen2.5:3b"],
+            index=1,
+        )
         embedding_model = st.text_input("嵌入模型", value="bge-m3")
         base_url = st.text_input("Ollama 地址", value="http://localhost:11434")
         st.caption("更换嵌入模型后，需要重新向量化全部现有文档。")
         rag = get_rag(llm_model, embedding_model, base_url)
 
     top_k = st.slider("最多显示来源数", 1, 5, 3)
+    retrieval_mode = st.radio(
+        "检索模式",
+        ["hybrid", "vector", "bm25"],
+        format_func=lambda value: {
+            "hybrid": "混合检索", "vector": "纯向量检索", "bm25": "纯 BM25"
+        }[value],
+        horizontal=True,
+    )
+    use_rerank = st.checkbox("启用 BGE Rerank 重排", value=False)
+    if use_rerank:
+        st.caption("首次启用需下载重排模型，之后本地运行。")
+
     try:
-        st.metric("权限范围内向量切片", rag.accessible_chunk_count(user))
+        stats = rag.get_stats(user)
+        row1 = st.columns(2)
+        row1[0].metric("文档", stats["documents"])
+        row1[1].metric("切片", stats["chunks"])
+        row2 = st.columns(2)
+        row2[0].metric("敏感命中", stats["sensitive_hits"])
+        row2[1].metric("今日问答", stats["today_qa"])
     except Exception:
-        st.caption("向量库尚未初始化")
+        st.caption("统计面板尚未初始化")
 
     st.divider()
     if st.button("生成我的问答 CSV", use_container_width=True):
@@ -112,8 +135,9 @@ with st.sidebar:
             mime="text/csv",
             use_container_width=True,
         )
+        st.caption("已嵌入当前账户的零宽溯源水印")
 
-    with st.expander("修改密码"):
+    with st.expander("修改密码"): 
         with st.form("password_form"):
             old_password = st.text_input("原密码", type="password")
             new_password = st.text_input("新密码（至少 8 位）", type="password")
@@ -140,8 +164,13 @@ def show_sources(sources: list[dict], record_id: int) -> None:
                 f"**[资料{source['id']}] {source['source']} · {page}**"
             )
             matched = source.get("matched") or []
+            source_note = []
             if matched:
-                st.caption("命中词：" + "、".join(matched))
+                source_note.append("命中词：" + "、".join(matched))
+            if source.get("confidence") is not None:
+                source_note.append(f"匹配分 {source['confidence']}/100")
+            if source_note:
+                st.caption(" · ".join(source_note))
             evidence = source.get("evidence") or source["content"][:240] + "……"
             st.markdown(f"> {evidence}")
 
@@ -183,6 +212,32 @@ def show_sources(sources: list[dict], record_id: int) -> None:
             st.divider()
 
 
+def show_answer_meta(record: dict) -> None:
+    confidence = int(record.get("confidence", 0))
+    mode_names = {"hybrid": "混合", "vector": "纯向量", "bm25": "纯 BM25"}
+    mode = mode_names.get(record.get("retrieval_mode"), record.get("retrieval_mode") or "旧版")
+    rerank = "＋Rerank" if record.get("rerank_used") else ""
+    st.caption(
+        f"{record['created_at']} · {record.get('model') or '旧版模型'} · {mode}{rerank}"
+    )
+    st.progress(confidence / 100, text=f"检索匹配置信度：{confidence}/100")
+    if confidence < 60:
+        st.warning("知识库匹配度较低，回答仅供参考，请仔细核对原文。")
+
+    feedback = record.get("feedback", "")
+    if feedback:
+        st.caption("已反馈：" + ("👍 有用" if feedback == "useful" else "👎 无用"))
+    col1, col2, _ = st.columns([1, 1, 5])
+    with col1:
+        if st.button("👍 有用", key=f"useful_{record['id']}"):
+            rag.set_feedback(user, int(record["id"]), "useful")
+            st.rerun()
+    with col2:
+        if st.button("👎 无用", key=f"useless_{record['id']}"):
+            rag.set_feedback(user, int(record["id"]), "useless")
+            st.rerun()
+
+
 def render_documents() -> None:
     docs = rag.list_documents(user)
     if not docs:
@@ -200,7 +255,7 @@ def render_documents() -> None:
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
-tab_names = ["教务问答", "我的知识库"]
+tab_names = ["教务问答", "我的知识库", "版本对比"]
 if user["role"] == "admin":
     tab_names += ["文档管理", "审计日志"]
 tabs = st.tabs(tab_names)
@@ -213,7 +268,7 @@ with tabs[0]:
         with st.chat_message("user"):
             st.markdown(record["question"])
         with st.chat_message("assistant"):
-            st.caption(record["created_at"])
+            show_answer_meta(record)
             st.markdown(record["answer"])
             show_sources(record["sources"], int(record["id"]))
 
@@ -221,7 +276,13 @@ with tabs[0]:
     if question:
         try:
             with st.spinner("正在权限范围内检索并生成回答……"):
-                rag.ask(user, question, top_k=top_k)
+                rag.ask(
+                    user,
+                    question,
+                    top_k=top_k,
+                    retrieval_mode=retrieval_mode,
+                    use_rerank=use_rerank,
+                )
             st.session_state.pop("qa_csv", None)
             st.rerun()
         except Exception as exc:
@@ -231,8 +292,33 @@ with tabs[1]:
     st.subheader("当前角色可访问的文档")
     render_documents()
 
+with tabs[2]:
+    st.subheader("同一问题的回答版本对比")
+    all_records = rag.get_qa_records(user, limit=200)
+    questions = sorted({record["question"] for record in all_records})
+    if not questions:
+        st.info("暂无可对比的问答版本。")
+    else:
+        selected_question = st.selectbox("选择历史问题", questions)
+        versions = list(reversed([
+            record for record in all_records if record["question"] == selected_question
+        ]))
+        for version in versions:
+            title = (
+                f"#{version['id']} · {version['created_at']} · "
+                f"{version.get('model') or '旧版'} · "
+                f"{version.get('retrieval_mode', 'hybrid')} · "
+                f"置信度 {version.get('confidence', 0)}"
+            )
+            with st.expander(title, expanded=len(versions) == 1):
+                st.markdown(version["answer"])
+                st.caption(
+                    "Rerank：" + ("开启" if version.get("rerank_used") else "关闭")
+                    + "；反馈：" + (version.get("feedback") or "未反馈")
+                )
+
 if user["role"] == "admin":
-    with tabs[2]:
+    with tabs[3]:
         st.subheader("批量导入")
         group_labels = {name: key for key, name in GROUPS.items()}
         target_group = group_labels[
@@ -244,7 +330,29 @@ if user["role"] == "admin":
             accept_multiple_files=True,
         )
         st.caption("支持 Word DOCX 的正文和表格；旧版 DOC 请先用 Word 另存为 DOCX。")
-        if st.button("保存并逐篇向量化", type="primary"):
+        preflight_fatal = False
+        if uploads:
+            st.markdown("**上传预检**")
+            cache = st.session_state.setdefault("preflight_cache", {})
+            for upload in uploads:
+                content = upload.getvalue()
+                digest = hashlib.sha256(
+                    target_group.encode("utf-8") + upload.name.encode("utf-8") + content
+                ).hexdigest()
+                if digest not in cache:
+                    cache[digest] = rag.preflight_document(
+                        user, target_group, upload.name, content
+                    )
+                check = cache[digest]
+                if not check["ok"]:
+                    preflight_fatal = True
+                    st.error(f"{upload.name}：{check['warning']}")
+                elif check["warning"]:
+                    st.warning(f"{upload.name}：{check['warning']}（仍可继续导入）")
+                else:
+                    st.success(f"{upload.name}：预检通过，提取到 {check['char_count']} 个字符")
+
+        if st.button("保存并逐篇向量化", type="primary", disabled=preflight_fatal):
             if not uploads:
                 st.warning("请先选择文件。")
             else:
@@ -299,12 +407,26 @@ if user["role"] == "admin":
                     except Exception as exc:
                         st.error(f"删除失败：{exc}")
 
-    with tabs[3]:
+    with tabs[4]:
         st.subheader("角色访问审计日志")
         role_filter_label = st.selectbox(
             "按角色筛选", ["全部角色", "学生", "辅导员", "管理员"]
         )
         label_to_role = {None: None, "全部角色": None, **{v: k for k, v in ROLE_NAMES.items()}}
+        if st.button("生成脱敏审计日志 CSV"):
+            try:
+                st.session_state.audit_csv = rag.export_audit_csv(user)
+                st.success("已生成：用户与敏感信息脱敏，并嵌入当前管理员水印。")
+            except Exception as exc:
+                st.error(f"审计日志导出失败：{exc}")
+        if st.session_state.get("audit_csv"):
+            st.download_button(
+                "下载审计日志 CSV",
+                data=st.session_state.audit_csv,
+                file_name="校务通_脱敏审计日志.csv",
+                mime="text/csv",
+            )
+
         logs = rag.get_audit_logs(user, role=label_to_role[role_filter_label], limit=300)
         if logs:
             rows = [
