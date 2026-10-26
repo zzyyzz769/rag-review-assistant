@@ -1,9 +1,13 @@
-"""校务通：本地 RAG 核心逻辑。
+"""校务通核心逻辑：本地 RAG、RBAC 权限隔离、审计和问答记录。"""
 
-负责文档加载、切片、向量化、Chroma 持久化、检索和回答生成。
-运行前确保 Ollama 已启动，并已下载生成模型与嵌入模型。
-"""
-
+import csv
+import hashlib
+import hmac
+import io
+import json
+import secrets
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -14,14 +18,37 @@ from langchain_ollama import OllamaEmbeddings, OllamaLLM
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
+GROUPS = {
+    "student": "学生文档",
+    "counselor": "辅导员文档",
+    "admin": "管理员文档",
+}
+ROLE_NAMES = {
+    "student": "学生",
+    "counselor": "辅导员",
+    "admin": "管理员",
+}
+# 角色可访问的独立知识库。所有检索和原文读取均在此再次校验。
+ROLE_ACCESS = {
+    "student": ("student",),
+    "counselor": ("student", "counselor"),
+    "admin": ("student", "counselor", "admin"),
+}
+COLLECTIONS = {
+    "student": "campus_student",
+    "counselor": "campus_counselor",
+    "admin": "campus_admin",
+}
+
+
 class CampusRAG:
-    """一个面向校园教务文档的轻量、全本地 RAG 知识库。"""
+    """校务通本地核心。actor 必须包含 username 和 role。"""
 
     def __init__(
         self,
         data_dir: str = "data",
         db_dir: str = "chroma_db",
-        collection_name: str = "campus_affairs",
+        system_db: str = "campus_system.db",
         llm_model: str = "qwen2.5:3b",
         embedding_model: str = "bge-m3",
         ollama_base_url: str = "http://localhost:11434",
@@ -30,255 +57,494 @@ class CampusRAG:
     ) -> None:
         self.data_dir = Path(data_dir)
         self.db_dir = Path(db_dir)
+        self.system_db = Path(system_db)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_dir.mkdir(parents=True, exist_ok=True)
+        for group in GROUPS:
+            (self.data_dir / GROUPS[group]).mkdir(parents=True, exist_ok=True)
 
-        self.collection_name = collection_name
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        self._vectorstore: Chroma | None = None
-
-        self.embeddings = OllamaEmbeddings(
-            model=embedding_model,
-            base_url=ollama_base_url,
-        )
-        self.llm = OllamaLLM(
-            model=llm_model,
-            base_url=ollama_base_url,
-            temperature=0.1,
-        )
+        self._vectorstores: dict[str, Chroma] = {}
+        self.embeddings = OllamaEmbeddings(model=embedding_model, base_url=ollama_base_url)
+        self.llm = OllamaLLM(model=llm_model, base_url=ollama_base_url, temperature=0.1)
         self.splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
-            separators=[
-                "\n\n",
-                "\n",
-                "。",
-                "！",
-                "？",
-                "；",
-                ".",
-                " ",
-                "",
-            ],
+            separators=["\n\n", "\n", "。", "！", "？", "；", ".", " ", ""],
         )
+        self._init_system_db()
 
-    @property
-    def vectorstore(self) -> Chroma:
-        """延迟打开本地 Chroma，避免仅导入模块时就初始化数据库。"""
-        if self._vectorstore is None:
-            self._vectorstore = Chroma(
-                collection_name=self.collection_name,
+    # ---------- 通用与权限 ----------
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now().astimezone().isoformat(timespec="seconds")
+
+    @staticmethod
+    def _role(actor: dict[str, str]) -> str:
+        role = str(actor.get("role", ""))
+        if role not in ROLE_ACCESS or not actor.get("username"):
+            raise PermissionError("登录状态无效，请重新登录。")
+        return role
+
+    def _allowed_groups(self, actor: dict[str, str]) -> tuple[str, ...]:
+        return ROLE_ACCESS[self._role(actor)]
+
+    def _require_admin(self, actor: dict[str, str]) -> None:
+        if self._role(actor) != "admin":
+            raise PermissionError("仅管理员可以执行文档管理操作。")
+
+    @staticmethod
+    def _safe_filename(filename: str) -> str:
+        # 同时处理 Windows 与 POSIX 分隔符，防止路径穿越。
+        name = filename.replace("\\", "/").split("/")[-1].strip()
+        if not name or name in {".", ".."} or any(ord(c) < 32 for c in name):
+            raise ValueError("文件名无效。")
+        if Path(name).suffix.lower() not in {".pdf", ".txt"}:
+            raise ValueError("仅支持 PDF 和 TXT 文件。")
+        return name
+
+    def _path(self, group: str, filename: str) -> Path:
+        if group not in GROUPS:
+            raise ValueError("未知文档分组。")
+        return self.data_dir / GROUPS[group] / self._safe_filename(filename)
+
+    def _vectorstore(self, group: str) -> Chroma:
+        if group not in GROUPS:
+            raise ValueError("未知知识库分组。")
+        if group not in self._vectorstores:
+            self._vectorstores[group] = Chroma(
+                collection_name=COLLECTIONS[group],
                 embedding_function=self.embeddings,
                 persist_directory=str(self.db_dir),
             )
-        return self._vectorstore
+        return self._vectorstores[group]
+
+    # ---------- 用户、密码与审计 ----------
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.system_db, timeout=30)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_system_db(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY,
+                    role TEXT NOT NULL,
+                    salt TEXT NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    iterations INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS audit_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    resource TEXT NOT NULL,
+                    detail TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS qa_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    answer TEXT NOT NULL,
+                    sources_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_audit_role
+                    ON audit_logs(role, created_at);
+                CREATE INDEX IF NOT EXISTS idx_qa_user
+                    ON qa_records(username, created_at);
+                """
+            )
+
+        # 仅首次运行创建演示账户；修改密码后不会被覆盖。
+        defaults = (
+            ("student", "student", "Student@123"),
+            ("counselor", "counselor", "Counselor@123"),
+            ("admin", "admin", "Admin@123"),
+        )
+        for username, role, password in defaults:
+            with self._connect() as conn:
+                exists = conn.execute(
+                    "SELECT 1 FROM users WHERE username = ?", (username,)
+                ).fetchone()
+            if not exists:
+                salt, digest, iterations = self._hash_password(password)
+                with self._connect() as conn:
+                    conn.execute(
+                        "INSERT INTO users VALUES (?, ?, ?, ?, ?, ?)",
+                        (username, role, salt, digest, iterations, self._now()),
+                    )
+
+    @staticmethod
+    def _hash_password(password: str, salt: str | None = None) -> tuple[str, str, int]:
+        iterations = 260_000
+        salt = salt or secrets.token_hex(16)
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), bytes.fromhex(salt), iterations
+        ).hex()
+        return salt, digest, iterations
+
+    def _audit(
+        self,
+        username: str,
+        role: str,
+        action: str,
+        resource: str = "",
+        detail: str = "",
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO audit_logs (created_at, username, role, action, resource, detail)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (self._now(), username, role, action, resource, detail[:2000]),
+            )
+
+    def authenticate(self, username: str, password: str) -> dict[str, str] | None:
+        username = username.strip()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE username = ?", (username,)
+            ).fetchone()
+
+        valid = False
+        role = "unknown"
+        if row:
+            role = row["role"]
+            # 使用账户保存的迭代数重新计算，兼容未来调整。
+            candidate = hashlib.pbkdf2_hmac(
+                "sha256",
+                password.encode("utf-8"),
+                bytes.fromhex(row["salt"]),
+                int(row["iterations"]),
+            ).hex()
+            valid = hmac.compare_digest(candidate, row["password_hash"])
+
+        self._audit(
+            username or "空用户名",
+            role,
+            "login_success" if valid else "login_failed",
+            detail="本地账号密码登录",
+        )
+        return {"username": username, "role": role} if valid else None
+
+    def change_password(
+        self, actor: dict[str, str], old_password: str, new_password: str
+    ) -> None:
+        username = actor["username"]
+        self._role(actor)
+        if len(new_password) < 8:
+            raise ValueError("新密码至少需要 8 个字符。")
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM users WHERE username = ?", (username,)
+            ).fetchone()
+        if not row:
+            raise PermissionError("账户不存在。")
+        old_hash = hashlib.pbkdf2_hmac(
+            "sha256",
+            old_password.encode("utf-8"),
+            bytes.fromhex(row["salt"]),
+            int(row["iterations"]),
+        ).hex()
+        if not hmac.compare_digest(old_hash, row["password_hash"]):
+            raise ValueError("原密码不正确。")
+        salt, digest, iterations = self._hash_password(new_password)
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE users SET salt = ?, password_hash = ?, iterations = ?"
+                " WHERE username = ?",
+                (salt, digest, iterations, username),
+            )
+        self._audit(username, actor["role"], "change_password")
+
+    # ---------- 文档加载与单文档索引 ----------
 
     @staticmethod
     def _read_txt(path: Path) -> str:
-        """依次尝试常见编码，兼顾 UTF-8 与中文 Windows 文档。"""
         raw = path.read_bytes()
-
         for encoding in ("utf-8-sig", "utf-8", "gb18030"):
             try:
                 return raw.decode(encoding)
             except UnicodeDecodeError:
                 continue
-
         return raw.decode("utf-8", errors="replace")
 
-    def list_files(self) -> list[Path]:
-        """列出知识库目录中支持的全部文档。"""
-        return sorted(
-            path
-            for path in self.data_dir.iterdir()
-            if path.is_file()
-            and path.suffix.lower() in {".pdf", ".txt"}
-        )
-
-    def load_documents(self) -> list[Document]:
-        """加载 data 目录中的 PDF/TXT；PDF 的每个页面单独成为 Document。"""
+    def _load_file(self, group: str, filename: str) -> list[Document]:
+        path = self._path(group, filename)
+        if not path.is_file():
+            raise FileNotFoundError(f"文件不存在：{GROUPS[group]}/{filename}")
         documents: list[Document] = []
-        errors: list[str] = []
-
-        for path in self.list_files():
-            try:
-                if path.suffix.lower() == ".pdf":
-                    pages = PyPDFLoader(str(path)).load()
-
-                    for page in pages:
-                        text = page.page_content.strip()
-
-                        if not text:
-                            continue
-
-                        page_number = (
-                            int(page.metadata.get("page", 0)) + 1
+        if path.suffix.lower() == ".pdf":
+            for page in PyPDFLoader(str(path)).load():
+                text = page.page_content.strip()
+                if text:
+                    documents.append(
+                        Document(
+                            page_content=text,
+                            metadata={
+                                "source": filename,
+                                "page": int(page.metadata.get("page", 0)) + 1,
+                                "file_type": "pdf",
+                            },
                         )
-
-                        documents.append(
-                            Document(
-                                page_content=text,
-                                metadata={
-                                    "source": path.name,
-                                    "page": page_number,
-                                    "file_type": "pdf",
-                                },
-                            )
-                        )
-                else:
-                    text = self._read_txt(path).strip()
-
-                    if text:
-                        documents.append(
-                            Document(
-                                page_content=text,
-                                metadata={
-                                    "source": path.name,
-                                    "file_type": "txt",
-                                },
-                            )
-                        )
-
-            except Exception as exc:
-                # 汇总错误，避免静默遗漏教务资料。
-                errors.append(f"{path.name}：{exc}")
-
-        if errors:
-            raise RuntimeError(
-                "以下文档读取失败：\n" + "\n".join(errors)
-            )
-
+                    )
+        else:
+            text = self._read_txt(path).strip()
+            if text:
+                documents.append(
+                    Document(
+                        page_content=text,
+                        metadata={"source": filename, "file_type": "txt"},
+                    )
+                )
         if not documents:
-            raise ValueError(
-                "没有找到可读取的 PDF/TXT 内容，请先上传非空文档。"
-            )
-
+            raise ValueError(f"{filename} 中没有可读取的文字；扫描版 PDF 需先 OCR。")
         return documents
 
-    def build_index(self) -> dict[str, int]:
-        """对 data 目录全量重建索引，避免同名文件更新后产生旧切片残留。"""
-        documents = self.load_documents()
-        chunks = self.splitter.split_documents(documents)
-        chunks = [
-            doc for doc in chunks
-            if doc.page_content.strip()
-        ]
+    def save_document(
+        self, actor: dict[str, str], group: str, filename: str, content: bytes
+    ) -> str:
+        self._require_admin(actor)
+        if not content:
+            raise ValueError(f"{filename} 是空文件。")
+        path = self._path(group, filename)
+        path.write_bytes(content)
+        self._audit(
+            actor["username"], actor["role"], "upload_document",
+            f"{group}/{path.name}", f"{len(content)} bytes",
+        )
+        return path.name
 
-        if not chunks:
-            raise ValueError("文档切片后没有有效文本。")
-
+    def index_document(self, actor: dict[str, str], group: str, filename: str) -> int:
+        """只删除并重写当前文件的向量，不影响同库其他文档。"""
+        self._require_admin(actor)
+        filename = self._safe_filename(filename)
+        documents = self._load_file(group, filename)
+        chunks = [d for d in self.splitter.split_documents(documents) if d.page_content.strip()]
         for index, doc in enumerate(chunks, start=1):
-            doc.metadata["chunk"] = index
+            doc.metadata.update({
+                "group": group,
+                "source": filename,
+                "doc_id": f"{group}/{filename}",
+                "chunk": index,
+            })
+        store = self._vectorstore(group)
+        store.delete(where={"source": filename})
+        if chunks:
+            for start in range(0, len(chunks), 32):
+                store.add_documents(chunks[start:start + 32])
+        self._audit(
+            actor["username"], actor["role"], "index_document",
+            f"{group}/{filename}", f"{len(chunks)} 个切片",
+        )
+        return len(chunks)
 
-        # 删除旧 collection 后重新创建。
-        # Chroma 会自动持久化，无需手动调用 persist()。
-        self.vectorstore.delete_collection()
-        self._vectorstore = None
-
-        # 小批量写入，降低本地嵌入模型瞬时内存压力。
-        batch_size = 32
-
-        for start in range(0, len(chunks), batch_size):
-            self.vectorstore.add_documents(
-                chunks[start:start + batch_size]
-            )
-
-        return {
-            "files": len(self.list_files()),
-            "pages_or_docs": len(documents),
-            "chunks": len(chunks),
-        }
-
-    def clear_index(self) -> None:
-        """仅清空向量索引，不删除原始文档。"""
-        self.vectorstore.delete_collection()
-        self._vectorstore = None
-
-    def chunk_count(self) -> int:
-        """返回当前向量库中的文本切片数量。"""
-        return int(self.vectorstore._collection.count())
-
-    @staticmethod
-    def _source_label(doc: Document) -> str:
-        source = str(doc.metadata.get("source", "未知文件"))
-        page = doc.metadata.get("page")
-
-        if page:
-            return f"{source}（第 {page} 页）"
-
-        return source
-
-    def ask(
-        self,
-        question: str,
-        top_k: int = 4,
-    ) -> dict[str, Any]:
-        """检索相关片段，让本地大模型仅依据片段作答，并返回原文来源。"""
-        question = question.strip()
-
-        if not question:
-            raise ValueError("问题不能为空。")
-
-        if self.chunk_count() == 0:
-            raise ValueError(
-                "知识库为空，请先上传文档并重建索引。"
-            )
-
-        docs = self.vectorstore.similarity_search(
-            question,
-            k=top_k,
+    def delete_document(self, actor: dict[str, str], group: str, filename: str) -> None:
+        self._require_admin(actor)
+        path = self._path(group, filename)
+        self._vectorstore(group).delete(where={"source": path.name})
+        path.unlink(missing_ok=True)
+        self._audit(
+            actor["username"], actor["role"], "delete_document", f"{group}/{path.name}"
         )
 
-        if not docs:
-            return {
-                "answer": "未检索到相关资料。",
-                "sources": [],
-            }
+    def list_documents(self, actor: dict[str, str]) -> list[dict[str, Any]]:
+        result = []
+        for group in self._allowed_groups(actor):
+            folder = self.data_dir / GROUPS[group]
+            for path in sorted(folder.iterdir()):
+                if path.is_file() and path.suffix.lower() in {".pdf", ".txt"}:
+                    result.append({
+                        "doc_id": f"{group}/{path.name}",
+                        "group": group,
+                        "group_name": GROUPS[group],
+                        "filename": path.name,
+                        "size_kb": round(path.stat().st_size / 1024, 1),
+                        "modified": datetime.fromtimestamp(path.stat().st_mtime).strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        ),
+                    })
+        return result
 
-        context_blocks = []
-        sources = []
+    def accessible_chunk_count(self, actor: dict[str, str]) -> int:
+        return sum(
+            int(self._vectorstore(group)._collection.count())
+            for group in self._allowed_groups(actor)
+        )
 
-        for index, doc in enumerate(docs, start=1):
-            label = self._source_label(doc)
+    # ---------- 检索、问答与原文 ----------
 
-            context_blocks.append(
-                f"[资料{index}] 来源：{label}\n"
-                f"{doc.page_content.strip()}"
+    def ask(self, actor: dict[str, str], question: str, top_k: int = 4) -> dict[str, Any]:
+        allowed = self._allowed_groups(actor)
+        question = question.strip()
+        if not question:
+            raise ValueError("问题不能为空。")
+        top_k = max(1, min(int(top_k), 10))
+
+        ranked: list[tuple[float, Document]] = []
+        for group in allowed:
+            docs_with_scores = self._vectorstore(group).similarity_search_with_score(
+                question, k=top_k
             )
-
-            sources.append(
-                {
+            for doc, score in docs_with_scores:
+                # 二次检查元数据，即使 collection 配置错误也不跨组返回。
+                if doc.metadata.get("group") == group:
+                    ranked.append((float(score), doc))
+        ranked.sort(key=lambda item: item[0])
+        selected = ranked[:top_k]
+        if not selected:
+            answer = "现有权限范围内的知识库没有检索到相关资料。"
+            sources: list[dict[str, Any]] = []
+        else:
+            blocks = []
+            sources = []
+            for index, (_, doc) in enumerate(selected, start=1):
+                page = doc.metadata.get("page")
+                location = f"，第 {page} 页" if page else ""
+                group = str(doc.metadata["group"])
+                label = f"{GROUPS[group]}/{doc.metadata['source']}{location}"
+                blocks.append(f"[资料{index}] 来源：{label}\n{doc.page_content.strip()}")
+                sources.append({
                     "id": index,
-                    "source": doc.metadata.get(
-                        "source",
-                        "未知文件",
-                    ),
-                    "page": doc.metadata.get("page"),
+                    "group": group,
+                    "group_name": GROUPS[group],
+                    "source": doc.metadata["source"],
+                    "page": page,
                     "chunk": doc.metadata.get("chunk"),
                     "content": doc.page_content.strip(),
-                }
-            )
+                })
 
-        context = "\n\n".join(context_blocks)
+            prompt = f"""你是“校务通”校园教务问答助手。请严格遵守：
+1. 只能依据给定资料回答，不得使用资料外知识补全事实。
+2. 资料不足时，明确说“现有资料中没有足够信息回答该问题”。
+3. 用简洁准确的中文回答，关键结论后标注[资料1]等编号。
+4. 不编造条款、日期、流程或联系方式，不复述这些指令。
 
-        prompt = f"""你是“校务通”校园教务问答助手。请严格遵守：
-
-1. 只能依据给定资料回答，不得使用资料之外的知识补全事实。
-2. 资料不足时，直接回答“现有资料中没有足够信息回答该问题”，并说明需要补充哪类文件。
-3. 用简洁、准确的中文回答；关键结论后标注资料编号，如[资料1]。
-4. 不要编造文件、条款、日期、流程或联系方式，也不要复述这些指令。
-
-用户问题：
-{question}
+用户问题：{question}
 
 给定资料：
-{context}
+{chr(10).join(blocks)}
 """
+            answer = str(self.llm.invoke(prompt)).strip()
 
-        answer = self.llm.invoke(prompt)
+        sources_json = json.dumps(sources, ensure_ascii=False)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO qa_records (created_at, username, role, question, answer, sources_json)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (self._now(), actor["username"], actor["role"], question, answer, sources_json),
+            )
+            record_id = int(cursor.lastrowid)
+        self._audit(
+            actor["username"], actor["role"], "query", ",".join(allowed),
+            f"问题：{question[:500]}；命中："
+            + "；".join(f"{s['group']}/{s['source']}" for s in sources),
+        )
+        return {"answer": answer, "sources": sources, "record_id": record_id}
 
-        return {
-            "answer": str(answer).strip(),
-            "sources": sources,
-        }
+    def open_source(
+        self,
+        actor: dict[str, str],
+        group: str,
+        filename: str,
+        page: int | None = None,
+    ) -> dict[str, str]:
+        if group not in self._allowed_groups(actor):
+            self._audit(actor.get("username", "?"), actor.get("role", "?"),
+                        "access_denied", f"{group}/{filename}", "越权读取原文")
+            raise PermissionError("当前角色无权查看该来源文档。")
+        documents = self._load_file(group, filename)
+        if page is not None:
+            pages = [d for d in documents if d.metadata.get("page") == page]
+            if not pages:
+                raise ValueError("未找到对应 PDF 页面。")
+            text = "\n\n".join(d.page_content for d in pages)
+            location = f"第 {page} 页"
+        else:
+            text = "\n\n".join(d.page_content for d in documents)
+            location = "TXT 全文"
+        self._audit(
+            actor["username"], actor["role"], "view_source",
+            f"{group}/{filename}", location,
+        )
+        return {"text": text, "location": location}
+
+    # ---------- 历史、CSV 与审计查询 ----------
+
+    def get_qa_records(self, actor: dict[str, str], limit: int = 30) -> list[dict[str, Any]]:
+        self._role(actor)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM qa_records WHERE username = ? ORDER BY id DESC LIMIT ?",
+                (actor["username"], max(1, min(limit, 200))),
+            ).fetchall()
+        records = []
+        for row in rows:
+            records.append({
+                "id": row["id"],
+                "created_at": row["created_at"],
+                "question": row["question"],
+                "answer": row["answer"],
+                "sources": json.loads(row["sources_json"]),
+            })
+        return records
+
+    @staticmethod
+    def _csv_safe(value: Any) -> str:
+        """避免用户文本在 Excel 中被当作公式执行。"""
+        text = str(value)
+        return "'" + text if text.lstrip().startswith(("=", "+", "-", "@")) else text
+
+    def export_qa_csv(self, actor: dict[str, str]) -> bytes:
+        self._role(actor)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM qa_records WHERE username = ? ORDER BY id ASC",
+                (actor["username"],),
+            ).fetchall()
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
+        writer.writerow(["时间", "用户名", "角色", "问题", "回答", "原文来源"])
+        for row in rows:
+            sources = json.loads(row["sources_json"])
+            source_text = "\n".join(
+                f"[资料{s['id']}] {s['group_name']}/{s['source']}"
+                + (f" 第{s['page']}页" if s.get("page") else "")
+                + f" 切片{s.get('chunk', '')}\n{s['content']}"
+                for s in sources
+            )
+            writer.writerow([
+                self._csv_safe(value) for value in (
+                    row["created_at"], row["username"],
+                    ROLE_NAMES.get(row["role"], row["role"]),
+                    row["question"], row["answer"], source_text,
+                )
+            ])
+        self._audit(actor["username"], actor["role"], "export_qa_csv", detail=f"{len(rows)} 条")
+        # UTF-8 BOM，方便 Windows Excel 直接打开而不乱码。
+        return output.getvalue().encode("utf-8-sig")
+
+    def get_audit_logs(
+        self, actor: dict[str, str], role: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        self._require_admin(actor)
+        limit = max(1, min(int(limit), 1000))
+        sql = "SELECT * FROM audit_logs"
+        params: list[Any] = []
+        if role in ROLE_NAMES:
+            sql += " WHERE role = ?"
+            params.append(role)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(row) for row in rows]
