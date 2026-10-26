@@ -3,6 +3,7 @@
 import html
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from rag_core import GROUPS, ROLE_ACCESS, ROLE_NAMES, CampusRAG
 
@@ -29,7 +30,7 @@ def highlight_document(text: str, snippet: str) -> str:
     safe_snippet = html.escape(snippet.strip())
     if safe_snippet and safe_snippet in safe_text:
         safe_text = safe_text.replace(
-            safe_snippet, f"<mark>{safe_snippet}</mark>", 1
+            safe_snippet, f"<mark id='active-highlight'>{safe_snippet}</mark>", 1
         )
     else:
         safe_text = (
@@ -90,7 +91,7 @@ with st.sidebar:
         st.caption("更换嵌入模型后，需要重新向量化全部现有文档。")
         rag = get_rag(llm_model, embedding_model, base_url)
 
-    top_k = st.slider("每次检索片段数", 2, 8, 4)
+    top_k = st.slider("最多显示来源数", 1, 5, 3)
     try:
         st.metric("权限范围内向量切片", rag.accessible_chunk_count(user))
     except Exception:
@@ -132,16 +133,21 @@ with st.sidebar:
 def show_sources(sources: list[dict], record_id: int) -> None:
     if not sources:
         return
-    with st.expander("查看来源 / 打开原文高亮"):
+    with st.expander(f"答案依据（{len(sources)} 条，已提取关键句）"):
         for source in sources:
-            page = f" · 第 {source['page']} 页" if source.get("page") else ""
+            page = f"第 {source['page']} 页" if source.get("page") else "全文"
             st.markdown(
-                f"**[资料{source['id']}] {source['group_name']}/"
-                f"{source['source']}{page} · 切片 {source.get('chunk', '')}**"
+                f"**[资料{source['id']}] {source['source']} · {page}**"
             )
-            st.caption(source["content"])
+            matched = source.get("matched") or []
+            if matched:
+                st.caption("命中词：" + "、".join(matched))
+            evidence = source.get("evidence") or source["content"][:240] + "……"
+            st.markdown(f"> {evidence}")
+
+            preview_key = f"{record_id}_{source['id']}"
             if st.button(
-                "打开来源文档并标黄",
+                "定位到原文",
                 key=f"source_{record_id}_{source['id']}",
             ):
                 try:
@@ -151,13 +157,30 @@ def show_sources(sources: list[dict], record_id: int) -> None:
                         source["source"],
                         source.get("page"),
                     )
+                    snippet = source.get("highlight") or evidence
                     st.session_state.preview = {
+                        "key": preview_key,
                         "title": f"{source['group_name']}/{source['source']}",
                         "location": opened["location"],
-                        "html": highlight_document(opened["text"], source["content"]),
+                        "html": highlight_document(opened["text"], snippet),
                     }
                 except Exception as exc:
                     st.error(f"原文打开失败：{exc}")
+
+            current = st.session_state.get("preview")
+            if current and current.get("key") == preview_key:
+                st.caption(f"原文位置：{current['location']}，黄色部分为关键句")
+                components.html(
+                    current["html"]
+                    + "<script>const el=document.getElementById('active-highlight');"
+                      "if(el){el.scrollIntoView({block:'center'});}</script>",
+                    height=560,
+                    scrolling=True,
+                )
+                if st.button("关闭原文", key=f"close_{record_id}_{source['id']}"):
+                    st.session_state.pop("preview", None)
+                    st.rerun()
+            st.divider()
 
 
 def render_documents() -> None:
@@ -194,15 +217,6 @@ with tabs[0]:
             st.markdown(record["answer"])
             show_sources(record["sources"], int(record["id"]))
 
-    if st.session_state.get("preview"):
-        preview = st.session_state.preview
-        st.subheader(f"原文高亮：{preview['title']}")
-        st.caption(preview["location"])
-        st.markdown(preview["html"], unsafe_allow_html=True)
-        if st.button("关闭原文预览"):
-            st.session_state.pop("preview", None)
-            st.rerun()
-
     question = st.chat_input("例如：本科生申请缓考需要哪些材料和步骤？")
     if question:
         try:
@@ -225,10 +239,11 @@ if user["role"] == "admin":
             st.selectbox("上传到权限分组", list(group_labels.keys()))
         ]
         uploads = st.file_uploader(
-            "可一次选择多个 PDF / TXT",
-            type=["pdf", "txt"],
+            "可一次选择多个 PDF / TXT / DOCX",
+            type=["pdf", "txt", "docx"],
             accept_multiple_files=True,
         )
+        st.caption("支持 Word DOCX 的正文和表格；旧版 DOC 请先用 Word 另存为 DOCX。")
         if st.button("保存并逐篇向量化", type="primary"):
             if not uploads:
                 st.warning("请先选择文件。")

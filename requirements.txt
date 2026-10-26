@@ -4,3 +4,6 @@ langchain-community
 langchain-ollama
 langchain-text-splitters
 pypdf
+python-docx
+jieba
+rank-bm25

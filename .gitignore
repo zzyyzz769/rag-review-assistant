@@ -3,9 +3,7 @@ __pycache__/
 .venv/
 venv/
 .env
+campus_system.db
 chroma_db/
 data/
 *.log
-.DS_Store
-Thumbs.db
-campus_system.db
