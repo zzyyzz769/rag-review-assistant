@@ -509,7 +509,7 @@ class CampusRAG:
             f"{metadata.get('page')}/{metadata.get('chunk')}"
         )
 
-    def _evidence(doc: Document, question: str) -> tuple[str, str, list[str]]:
+    def _evidence(self, doc: Document, question: str) -> tuple[str, str, list[str]]:
         """从切片中抽取最关键的 1～2 句，而不是把整段交给用户阅读。"""
         text = re.sub(r"[ \t]+", " ", doc.page_content.strip())
         sentences = [
