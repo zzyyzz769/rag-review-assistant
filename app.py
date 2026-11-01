@@ -10,6 +10,21 @@ from rag_core import GROUPS, ROLE_ACCESS, ROLE_NAMES, CampusRAG
 
 
 st.set_page_config(page_title="校务通", page_icon="🎓", layout="wide")
+st.markdown(
+    """
+    <style>
+    /* 提问框贴近页面底部；中间历史记录单独滚动，避免反复上下寻找。 */
+    div[data-testid="stChatInput"] {
+        position: sticky;
+        bottom: 0;
+        z-index: 20;
+        background: var(--background-color);
+        padding-top: 0.5rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 @st.cache_resource
@@ -288,24 +303,27 @@ with tab_map["教务问答"]:
     st.caption(
         "使用说明：直接输入你想问的事情，再查看结论、要点和原文依据。接着问“那需要什么材料？”也可以，"
         "系统会结合前面的对话理解你的意思。如果问题太简单、看不出要问什么，系统会先请你补充。"
+        "历史问答可在中间区域单独滚动，最新问答显示在最上方，下方输入框保持可见。"
     )
     if st.session_state.get("rerank_notice"):
         st.warning(st.session_state.pop("rerank_notice"))
     if st.session_state.get("generation_notice"):
         st.warning(st.session_state.pop("generation_notice"))
     records = list(reversed(rag.get_qa_records(user, limit=30)))
-    if not records:
-        st.info("请输入问题开始咨询。系统只会检索当前角色有权访问的知识库。")
-    for record in records:
-        with st.chat_message("user"):
-            st.text(record["question"])
-            resolved = record.get("resolved_question") or record["question"]
-            if resolved != record["question"]:
-                st.caption(f"追问已理解为：{resolved}")
-        with st.chat_message("assistant"): 
-            show_answer_meta(record)
-            st.text(plain_answer(record["answer"]))
-            show_sources(record["sources"], int(record["id"]))
+    with st.container(height=420, border=False):
+        if not records:
+            st.info("请输入问题开始咨询。系统只会检索当前角色有权访问的知识库。")
+        # 最新记录置顶，提交后无需先滚到最底部；records 仍保持时间顺序供追问使用。
+        for record in reversed(records):
+            with st.chat_message("user"):
+                st.text(record["question"])
+                resolved = record.get("resolved_question") or record["question"]
+                if resolved != record["question"]:
+                    st.caption(f"追问已理解为：{resolved}")
+            with st.chat_message("assistant"):
+                show_answer_meta(record)
+                st.text(plain_answer(record["answer"]))
+                show_sources(record["sources"], int(record["id"]))
 
     question = st.chat_input("请输入要查询的教务制度、办理条件或流程")
     if question:
