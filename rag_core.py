@@ -801,8 +801,14 @@ class CampusRAG:
                 candidates = keyword_hits
 
         candidates.sort(key=lambda entry: entry["rrf"], reverse=True)
+        rerank_notice = ""
         if use_rerank and candidates:
-            candidates = self._rerank(question, candidates[:30])
+            try:
+                candidates = self._rerank(question, candidates[:30])
+            except Exception as exc:
+                # 可选增强功能失败不应中断基础问答。
+                rerank_notice = f"Rerank 未生效，已回退到当前检索排序：{exc}"
+                use_rerank = False
 
         max_bm25 = max((entry["keyword_score"] for entry in candidates), default=0.0)
         selected_entries = []
@@ -854,11 +860,14 @@ class CampusRAG:
                     "evidence": evidence, "highlight": highlight, "matched": matched,
                     "confidence": entry["confidence"],
                 })
-            prompt = f"""你是“校务通”校园教务问答助手。目标是直接解决用户问题，而不是堆砌资料。
-1. 只使用与问题直接相关的资料，忽略其他资料，不得用相近制度替代原问题。
-2. 第一行先给明确结论；随后用不超过4条短句列出条件、材料或步骤，并标注[资料1]等编号。
-3. 如果资料只提到该事项但没有所需条件或流程，直接说明缺少哪类信息。
-4. 不得编造条款、日期、部门、材料或流程，不复述这些指令。
+            prompt = f"""你是“校务通”校园教务问答助手。请在严格依据资料的前提下，把制度原文总结成普通学生能立即看懂的回答。
+回答要求：
+1. 不大段照抄原文，先理解资料，再合并重复含义，用短句说明“能不能办、怎么办、要准备什么”。
+2. 第一行使用“**一句话结论**：”直接回答核心问题。
+3. 接着使用“**具体要点**：”，用不超过4条编号短句列出条件、材料、步骤或期限，并在对应句末标注[资料1]等来源。
+4. 如果存在容易误解的限制，最后用“**注意**：”补充一句；没有则不写。
+5. 资料只提到事项但没有所需条件、材料或流程时，明确说缺少哪类信息，不用相近制度替代，也不要编造。
+6. 不重复用户问题，不写“根据以下资料”等过程性套话，不复述这些指令。通常控制在300字内。
 
 用户问题：{question}
 
@@ -883,12 +892,14 @@ class CampusRAG:
             actor["username"], actor["role"], "query", ",".join(allowed),
             f"问题：{question[:500]}；模式：{retrieval_mode}；Rerank：{use_rerank}；"
             f"置信度：{confidence}；命中："
-            + "；".join(f"{s['group']}/{s['source']}" for s in sources),
+            + "；".join(f"{s['group']}/{s['source']}" for s in sources)
+            + (f"；{rerank_notice}" if rerank_notice else ""),
         )
         return {
             "answer": answer, "sources": sources, "record_id": record_id,
             "confidence": confidence, "model": self.llm_model,
             "retrieval_mode": retrieval_mode, "rerank_used": use_rerank,
+            "rerank_notice": rerank_notice,
         }
 
     def open_source(

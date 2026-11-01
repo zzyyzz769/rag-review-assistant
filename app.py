@@ -261,6 +261,8 @@ if user["role"] == "admin":
 tabs = st.tabs(tab_names)
 
 with tabs[0]:
+    if st.session_state.get("rerank_notice"):
+        st.warning(st.session_state.pop("rerank_notice"))
     records = list(reversed(rag.get_qa_records(user, limit=30)))
     if not records:
         st.info("请输入问题开始咨询。系统只会检索当前角色有权访问的知识库。")
@@ -276,13 +278,15 @@ with tabs[0]:
     if question:
         try:
             with st.spinner("正在权限范围内检索并生成回答……"):
-                rag.ask(
+                result = rag.ask(
                     user,
                     question,
                     top_k=top_k,
                     retrieval_mode=retrieval_mode,
                     use_rerank=use_rerank,
                 )
+            if result.get("rerank_notice"):
+                st.session_state.rerank_notice = result["rerank_notice"]
             st.session_state.pop("qa_csv", None)
             st.rerun()
         except Exception as exc:
