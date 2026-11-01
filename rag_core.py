@@ -8,8 +8,9 @@ import json
 import re
 import secrets
 import sqlite3
+import time
 import zipfile
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,8 @@ from pypdf import PdfReader
 
 
 SUPPORTED_EXTENSIONS = {".pdf", ".txt", ".docx"}
+MAX_FILE_SIZE = 50 * 1024 * 1024
+MAX_QUESTION_LENGTH = 500
 GROUPS = {
     "student": "学生文档",
     "counselor": "辅导员文档",
@@ -111,6 +114,7 @@ class CampusRAG:
         self.llm_model = llm_model
         self.reranker_model = reranker_model
         self._reranker: Any = None
+        self._ocr_engine: Any = None
         self.embeddings = OllamaEmbeddings(model=embedding_model, base_url=ollama_base_url)
         self.llm = OllamaLLM(
             model=llm_model,
@@ -214,7 +218,8 @@ class CampusRAG:
                     retrieval_mode TEXT NOT NULL DEFAULT 'hybrid',
                     feedback TEXT NOT NULL DEFAULT '',
                     feedback_at TEXT,
-                    rerank_used INTEGER NOT NULL DEFAULT 0
+                    rerank_used INTEGER NOT NULL DEFAULT 0,
+                    resolved_question TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS document_checks (
                     group_name TEXT NOT NULL,
@@ -223,6 +228,31 @@ class CampusRAG:
                     warning TEXT NOT NULL DEFAULT '',
                     checked_at TEXT NOT NULL,
                     PRIMARY KEY (group_name, filename)
+                );
+                CREATE TABLE IF NOT EXISTS document_meta (
+                    group_name TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    academic_year TEXT NOT NULL DEFAULT '',
+                    effective_date TEXT NOT NULL DEFAULT '',
+                    expiry_date TEXT NOT NULL DEFAULT '',
+                    is_current INTEGER NOT NULL DEFAULT 1,
+                    replaces TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (group_name, filename)
+                );
+                CREATE TABLE IF NOT EXISTS evaluation_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    retrieval_mode TEXT NOT NULL,
+                    rerank_used INTEGER NOT NULL DEFAULT 0,
+                    case_count INTEGER NOT NULL,
+                    recall_1 REAL NOT NULL,
+                    recall_3 REAL NOT NULL,
+                    mrr REAL NOT NULL,
+                    refusal_accuracy REAL NOT NULL,
+                    avg_latency_ms REAL NOT NULL,
+                    details_json TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_audit_role
                     ON audit_logs(role, created_at);
@@ -241,6 +271,7 @@ class CampusRAG:
                 "feedback": "TEXT NOT NULL DEFAULT ''",
                 "feedback_at": "TEXT",
                 "rerank_used": "INTEGER NOT NULL DEFAULT 0",
+                "resolved_question": "TEXT NOT NULL DEFAULT ''",
             }
             for name, definition in additions.items():
                 if name not in columns:
@@ -379,7 +410,8 @@ class CampusRAG:
         return text
 
     def preflight_document(
-        self, actor: dict[str, str], group: str, filename: str, content: bytes
+        self, actor: dict[str, str], group: str, filename: str, content: bytes,
+        allow_ocr: bool = False,
     ) -> dict[str, Any]:
         """上传前检查可读性、加密、扫描 PDF 与常见敏感信息。"""
         self._require_admin(actor)
@@ -390,6 +422,21 @@ class CampusRAG:
         scanned = False
         fatal = False
         text = ""
+        if len(content) > MAX_FILE_SIZE:
+            warning = "文件超过 50 MB，请拆分或压缩后再导入"
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO document_checks"
+                    " (group_name, filename, sensitive_count, warning, checked_at)"
+                    " VALUES (?, ?, 0, ?, ?)",
+                    (group, filename, warning, self._now()),
+                )
+            return {
+                "ok": False, "warning": warning, "encrypted": False, "scanned": False,
+                "sensitive_count": 0,
+                "sensitive_counts": {"手机号": 0, "身份证号": 0, "学号": 0},
+                "char_count": 0,
+            }
         try:
             if suffix == ".pdf":
                 reader = PdfReader(io.BytesIO(content))
@@ -401,7 +448,11 @@ class CampusRAG:
                     text = "\n".join(page_texts)
                     if not reader.pages or len(text.strip()) < max(20, len(reader.pages) * 10):
                         scanned = True
-                        warnings.append("疑似扫描/图片型 PDF，当前无法有效提取文字，请先 OCR")
+                        warnings.append(
+                            "疑似扫描/图片型 PDF，将在入库时执行本地 OCR"
+                            if allow_ocr else
+                            "疑似扫描/图片型 PDF，当前无法有效提取文字，请先 OCR"
+                        )
             elif suffix == ".docx":
                 if not zipfile.is_zipfile(io.BytesIO(content)):
                     encrypted = True
@@ -438,7 +489,7 @@ class CampusRAG:
         sensitive_count = sum(sensitive_counts.values())
         if sensitive_count:
             warnings.append(f"检测到 {sensitive_count} 处潜在敏感信息，请确认是否允许入库")
-        ok = not fatal and not encrypted and not scanned
+        ok = not fatal and not encrypted and (not scanned or allow_ocr)
         warning = "；".join(warnings)
         with self._connect() as conn:
             conn.execute(
@@ -457,22 +508,54 @@ class CampusRAG:
             "char_count": len(text.strip()),
         }
 
-    def _load_file(self, group: str, filename: str) -> list[Document]:
+    def _ocr_pdf_page(self, path: Path, page_index: int) -> str:
+        """使用 PyMuPDF 渲染页面，再由 RapidOCR 在本地识别中文。"""
+        try:
+            import fitz
+            import numpy as np
+            from PIL import Image
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError as exc:
+            raise RuntimeError(
+                "扫描件 OCR 需要安装 pymupdf、rapidocr_onnxruntime、numpy 和 pillow。"
+            ) from exc
+        if self._ocr_engine is None:
+            self._ocr_engine = RapidOCR()
+        with fitz.open(str(path)) as pdf:
+            if page_index < 0 or page_index >= len(pdf):
+                return ""
+            pixmap = pdf[page_index].get_pixmap(matrix=fitz.Matrix(2.5, 2.5), alpha=False)
+            image = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
+            result, _ = self._ocr_engine(np.asarray(image))
+        return "\n".join(
+            str(item[1]).strip() for item in (result or [])
+            if len(item) >= 2 and str(item[1]).strip()
+        )
+
+    def _load_file(
+        self, group: str, filename: str, use_ocr: bool = False
+    ) -> list[Document]:
         path = self._path(group, filename)
         if not path.is_file():
             raise FileNotFoundError(f"文件不存在：{GROUPS[group]}/{filename}")
         documents: list[Document] = []
         if path.suffix.lower() == ".pdf":
             for page in PyPDFLoader(str(path)).load():
+                page_index = int(page.metadata.get("page", 0))
                 text = page.page_content.strip()
+                used_ocr = False
+                if use_ocr and len(re.sub(r"\s+", "", text)) < 20:
+                    text = self._ocr_pdf_page(path, page_index).strip()
+                    used_ocr = bool(text)
                 if text:
                     documents.append(
                         Document(
                             page_content=text,
                             metadata={
                                 "source": filename,
-                                "page": int(page.metadata.get("page", 0)) + 1,
+                                "page": page_index + 1,
                                 "file_type": "pdf",
+                                "ocr": used_ocr,
                             },
                         )
                     )
@@ -506,6 +589,8 @@ class CampusRAG:
         self._require_admin(actor)
         if not content:
             raise ValueError(f"{filename} 是空文件。")
+        if len(content) > MAX_FILE_SIZE:
+            raise ValueError(f"{filename} 超过 50 MB，请拆分或压缩后再导入。")
         path = self._path(group, filename)
         path.write_bytes(content)
         self._audit(
@@ -514,11 +599,13 @@ class CampusRAG:
         )
         return path.name
 
-    def index_document(self, actor: dict[str, str], group: str, filename: str) -> int:
+    def index_document(
+        self, actor: dict[str, str], group: str, filename: str, use_ocr: bool = False
+    ) -> int:
         """只删除并重写当前文件的向量，不影响同库其他文档。"""
         self._require_admin(actor)
         filename = self._safe_filename(filename)
-        documents = self._load_file(group, filename)
+        documents = self._load_file(group, filename, use_ocr=use_ocr)
         chunks = [d for d in self.splitter.split_documents(documents) if d.page_content.strip()]
         for index, doc in enumerate(chunks, start=1):
             doc.metadata.update({
@@ -528,10 +615,38 @@ class CampusRAG:
                 "chunk": index,
             })
         store = self._vectorstore(group)
+        # 重建前保留旧向量；新增失败时直接写回旧向量，避免 embedding 服务故障也不丢索引。
+        previous = store.get(
+            where={"source": filename},
+            include=["documents", "metadatas", "embeddings"],
+        )
         store.delete(where={"source": filename})
-        if chunks:
-            for start in range(0, len(chunks), 32):
-                store.add_documents(chunks[start:start + 32])
+        try:
+            if chunks:
+                for start in range(0, len(chunks), 32):
+                    store.add_documents(chunks[start:start + 32])
+        except Exception as exc:
+            store.delete(where={"source": filename})
+            old_ids = list(previous.get("ids") or [])
+            if old_ids:
+                try:
+                    store._collection.add(
+                        ids=old_ids,
+                        documents=list(previous.get("documents") or []),
+                        metadatas=list(previous.get("metadatas") or []),
+                        embeddings=previous.get("embeddings"),
+                    )
+                except Exception as rollback_exc:
+                    self._audit(actor["username"], actor["role"], "index_rollback_failed",
+                                f"{group}/{filename}", str(rollback_exc))
+                    raise RuntimeError(
+                        f"重建失败，且旧索引自动恢复失败：{rollback_exc}。"
+                        "请修复模型服务后再次重新向量化。"
+                    ) from exc
+            rollback_note = "已恢复原有索引" if old_ids else "本次未写入新索引"
+            self._audit(actor["username"], actor["role"], "index_rollback",
+                        f"{group}/{filename}", rollback_note)
+            raise RuntimeError(f"重建失败，{rollback_note}：{exc}") from exc
         self._chunk_cache.pop(group, None)
         self._bm25_cache.pop(group, None)
         self._audit(
@@ -552,12 +667,80 @@ class CampusRAG:
                 "DELETE FROM document_checks WHERE group_name = ? AND filename = ?",
                 (group, path.name),
             )
+            conn.execute(
+                "DELETE FROM document_meta WHERE group_name = ? AND filename = ?",
+                (group, path.name),
+            )
         self._audit(
             actor["username"], actor["role"], "delete_document", f"{group}/{path.name}"
         )
 
+    @staticmethod
+    def _validate_date(value: str, label: str) -> str:
+        value = value.strip()
+        if not value:
+            return ""
+        try:
+            date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(f"{label}必须使用 YYYY-MM-DD 格式。") from exc
+        return value
+
+    def set_document_metadata(
+        self,
+        actor: dict[str, str],
+        group: str,
+        filename: str,
+        academic_year: str = "",
+        effective_date: str = "",
+        expiry_date: str = "",
+        is_current: bool = True,
+        replaces: str = "",
+    ) -> None:
+        self._require_admin(actor)
+        path = self._path(group, filename)
+        if not path.is_file():
+            raise FileNotFoundError("只能为已保存的文档设置版本信息。")
+        effective_date = self._validate_date(effective_date, "生效日期")
+        expiry_date = self._validate_date(expiry_date, "失效日期")
+        if effective_date and expiry_date and effective_date > expiry_date:
+            raise ValueError("失效日期不能早于生效日期。")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO document_meta"
+                " (group_name, filename, academic_year, effective_date, expiry_date,"
+                " is_current, replaces, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (group, path.name, academic_year.strip()[:40], effective_date,
+                 expiry_date, int(bool(is_current)), replaces.strip()[:200], self._now()),
+            )
+        self._audit(actor["username"], actor["role"], "document_metadata",
+                    f"{group}/{path.name}", f"{academic_year}；现行={bool(is_current)}")
+
+    def _document_meta_map(self) -> dict[tuple[str, str], dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM document_meta").fetchall()
+        result = {}
+        today = date.today().isoformat()
+        for row in rows:
+            current = bool(row["is_current"])
+            status = "现行有效" if current else "历史版本"
+            if row["effective_date"] and row["effective_date"] > today:
+                current, status = False, "尚未生效"
+            if row["expiry_date"] and row["expiry_date"] < today:
+                current, status = False, "已过期"
+            result[(row["group_name"], row["filename"])] = {
+                "academic_year": row["academic_year"],
+                "effective_date": row["effective_date"],
+                "expiry_date": row["expiry_date"],
+                "is_current": current,
+                "status": status,
+                "replaces": row["replaces"],
+            }
+        return result
+
     def list_documents(self, actor: dict[str, str]) -> list[dict[str, Any]]:
         result = []
+        metadata_map = self._document_meta_map()
         for group in self._allowed_groups(actor):
             folder = self.data_dir / GROUPS[group]
             for path in sorted(folder.iterdir()):
@@ -572,6 +755,10 @@ class CampusRAG:
                             "%Y-%m-%d %H:%M:%S"
                         ),
                     })
+                    result[-1].update(metadata_map.get((group, path.name), {
+                        "academic_year": "", "effective_date": "", "expiry_date": "",
+                        "is_current": True, "status": "现行有效", "replaces": "",
+                    }))
         return result
 
     def accessible_chunk_count(self, actor: dict[str, str]) -> int:
@@ -781,7 +968,7 @@ class CampusRAG:
             "**具体要点**：\n" + "\n".join(points)
         )
 
-    def ask(
+    def retrieve(
         self,
         actor: dict[str, str],
         question: str,
@@ -789,10 +976,13 @@ class CampusRAG:
         retrieval_mode: str = "hybrid",
         use_rerank: bool = False,
     ) -> dict[str, Any]:
+        """实际问答与评测共用的检索链路，不调用生成模型。"""
         allowed = self._allowed_groups(actor)
         question = question.strip()
         if not question:
             raise ValueError("问题不能为空。")
+        if len(question) > MAX_QUESTION_LENGTH:
+            raise ValueError("问题过长，请控制在 500 字以内。")
         if retrieval_mode not in {"vector", "bm25", "hybrid"}:
             raise ValueError("未知检索模式。")
         top_k = max(1, min(int(top_k), 6))
@@ -861,7 +1051,24 @@ class CampusRAG:
             if keyword_hits:
                 candidates = keyword_hits
 
-        candidates.sort(key=lambda entry: entry["rrf"], reverse=True)
+        metadata_map = self._document_meta_map()
+
+        def sort_candidates() -> None:
+            def sort_key(entry: dict[str, Any]) -> float:
+                doc = entry["doc"]
+                meta = metadata_map.get(
+                    (doc.metadata.get("group"), doc.metadata.get("source")), {}
+                )
+                rerank_score = entry.get("rerank_score")
+                score = float(rerank_score if rerank_score is not None else entry["rrf"])
+                # 现行版本只获得适度加分，不能用无关的新文件压过真正相关的旧规定。
+                if meta.get("is_current", True):
+                    score += 0.5 if rerank_score is not None else 0.003
+                return -score
+
+            candidates.sort(key=sort_key)
+
+        sort_candidates()
         rerank_notice = ""
         if use_rerank and candidates:
             try:
@@ -870,6 +1077,7 @@ class CampusRAG:
                 # 可选增强功能失败不应中断基础问答。
                 rerank_notice = f"Rerank 未生效，已回退到当前检索排序：{exc}"
                 use_rerank = False
+        sort_candidates()
 
         max_bm25 = max((entry["keyword_score"] for entry in candidates), default=0.0)
         selected_entries = []
@@ -895,8 +1103,88 @@ class CampusRAG:
             if len(selected_entries) >= top_k:
                 break
 
-        if not selected_entries:
-            topic = "、".join(core_terms) if core_terms else question
+        return {
+            "entries": selected_entries,
+            "core_terms": core_terms,
+            "rerank_notice": rerank_notice,
+            "rerank_used": use_rerank,
+        }
+
+    @staticmethod
+    def _clarification_needed(question: str, has_history: bool) -> str:
+        compact = re.sub(r"[\s，。！？?？]", "", question)
+        vague = {"怎么办", "怎么弄", "怎么申请", "如何办理", "需要什么材料", "要什么条件"}
+        if compact in vague and not has_history:
+            return (
+                "请先说明要办理的具体事项，例如“缓考怎么申请”或“奖学金需要什么材料”，"
+                "我再从知识库中查找对应规定。"
+            )
+        return ""
+
+    def _resolve_question(
+        self, question: str, history: list[dict[str, str]] | None
+    ) -> str:
+        """把简短追问补全为独立检索问题；失败时使用保守的原文拼接。"""
+        history = (history or [])[-2:]
+        if not history:
+            return question
+        followup_markers = ("那", "它", "这个", "这项", "还", "呢", "材料", "条件", "流程")
+        if len(question) > 18 and not any(marker in question for marker in followup_markers):
+            return question
+        previous = str(history[-1].get("question", "")).strip()
+        if not previous:
+            return question
+        prompt = f"""把最新追问改写成一个可独立检索的完整问题。保留上一问的具体事项，不回答，不解释，只输出一行问题。
+上一问：{previous}
+最新追问：{question}
+完整问题："""
+        try:
+            candidate = str(self.llm.invoke(prompt)).strip()
+            candidate = candidate.split("\n", 1)[0].strip().strip("“”\"'")
+            candidate = re.sub(r"^(完整问题|问题|改写结果)[:：]", "", candidate).strip()
+            if 3 <= len(candidate) <= 120 and "一句话结论" not in candidate:
+                return candidate
+        except Exception:
+            pass
+        return f"{previous}；追问：{question}"
+
+    def ask(
+        self,
+        actor: dict[str, str],
+        question: str,
+        top_k: int = 4,
+        retrieval_mode: str = "hybrid",
+        use_rerank: bool = False,
+        history: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        allowed = self._allowed_groups(actor)
+        question = question.strip()
+        if not question:
+            raise ValueError("问题不能为空。")
+        if len(question) > MAX_QUESTION_LENGTH:
+            raise ValueError("问题过长，请控制在 500 字以内。")
+        resolved_question = self._resolve_question(question, history)
+        clarification = self._clarification_needed(question, bool(history))
+        if clarification:
+            retrieval = {"entries": [], "core_terms": [], "rerank_notice": "", "rerank_used": False}
+            use_rerank = False
+        else:
+            retrieval = self.retrieve(
+                actor, resolved_question, top_k=top_k,
+                retrieval_mode=retrieval_mode, use_rerank=use_rerank,
+            )
+        selected_entries = retrieval["entries"]
+        core_terms = retrieval["core_terms"]
+        rerank_notice = retrieval["rerank_notice"]
+        use_rerank = retrieval["rerank_used"]
+        generation_notice = ""
+
+        if clarification:
+            answer = clarification
+            sources: list[dict[str, Any]] = []
+            confidence = 0
+        elif not selected_entries:
+            topic = "、".join(core_terms) if core_terms else resolved_question
             answer = (
                 f"未在当前权限范围内的文档中找到与“{topic}”直接相关的规定。"
                 "为避免误导，本次不附无关来源。请补充相关制度或换用原文表述。"
@@ -906,13 +1194,19 @@ class CampusRAG:
         else:
             blocks = []
             sources = []
+            metadata_map = self._document_meta_map()
             for index, entry in enumerate(selected_entries, start=1):
                 doc = entry["doc"]
                 page = doc.metadata.get("page")
                 location = f"，第 {page} 页" if page else ""
                 group = str(doc.metadata["group"])
-                evidence, highlight, matched = self._evidence(doc, question)
+                evidence, highlight, matched = self._evidence(doc, resolved_question)
+                meta = metadata_map.get((group, doc.metadata["source"]), {})
+                version_note = meta.get("academic_year", "")
                 label = f"{GROUPS[group]}/{doc.metadata['source']}{location}"
+                if version_note:
+                    label += f"，{version_note}"
+                label += f"，{meta.get('status', '现行有效')}"
                 blocks.append(
                     f"[资料{index}] 来源：{label}\n"
                     f"关键句：{evidence}\n"
@@ -924,6 +1218,12 @@ class CampusRAG:
                     "chunk": doc.metadata.get("chunk"), "content": doc.page_content.strip(),
                     "evidence": evidence, "highlight": highlight, "matched": matched,
                     "confidence": entry["confidence"],
+                    "academic_year": meta.get("academic_year", ""),
+                    "effective_date": meta.get("effective_date", ""),
+                    "expiry_date": meta.get("expiry_date", ""),
+                    "is_current": meta.get("is_current", True),
+                    "status": meta.get("status", "现行有效"),
+                    "replaces": meta.get("replaces", ""),
                 })
             prompt = f"""你是“校务通”校园教务问答助手。请阅读每份资料的关键句和上下文，把制度原文总结成普通学生能立即看懂的回答。
 回答要求：
@@ -935,12 +1235,18 @@ class CampusRAG:
 6. 资料确实没有所需信息时，明确指出缺少的是条件、材料还是流程，不得用相近制度替代或编造。
 7. 不重复用户问题，不复述指令，不写“根据以下资料”等套话。通常控制在300字内，信息完整后立即停止。
 
-用户问题：{question}
+用户问题：{resolved_question}
 
 资料：
 {chr(10).join(blocks)}
 """
-            raw_answer = str(self.llm.invoke(prompt)).strip()
+            try:
+                raw_answer = str(self.llm.invoke(prompt)).strip()
+            except Exception as exc:
+                raw_answer = ""
+                generation_notice = (
+                    f"总结模型暂时不可用，本次已改为直接整理证据句：{exc}"
+                )
             answer = self.clean_answer(raw_answer)
             severely_repeated = (
                 len(raw_answer) >= 160 and len(answer) <= len(raw_answer) * 0.55
@@ -951,7 +1257,7 @@ class CampusRAG:
                 or "一句话结论" not in answer
                 or "具体要点" not in answer
             ):
-                answer = self._fallback_answer(question, sources)
+                answer = self._fallback_answer(resolved_question, sources)
             values = [entry["confidence"] for entry in selected_entries]
             confidence = round(0.6 * max(values) + 0.4 * sum(values) / len(values))
 
@@ -959,25 +1265,254 @@ class CampusRAG:
         with self._connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO qa_records (created_at, username, role, question, answer,"
-                " sources_json, confidence, model, retrieval_mode, rerank_used)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " sources_json, confidence, model, retrieval_mode, rerank_used, resolved_question)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (self._now(), actor["username"], actor["role"], question, answer,
-                 sources_json, confidence, self.llm_model, retrieval_mode, int(use_rerank)),
+                 sources_json, confidence, self.llm_model, retrieval_mode, int(use_rerank),
+                 resolved_question),
             )
             record_id = int(cursor.lastrowid)
         self._audit(
             actor["username"], actor["role"], "query", ",".join(allowed),
-            f"问题：{question[:500]}；模式：{retrieval_mode}；Rerank：{use_rerank}；"
+            f"问题：{question[:500]}；补全：{resolved_question[:500]}；"
+            f"模式：{retrieval_mode}；Rerank：{use_rerank}；"
             f"置信度：{confidence}；命中："
             + "；".join(f"{s['group']}/{s['source']}" for s in sources)
-            + (f"；{rerank_notice}" if rerank_notice else ""),
+            + (f"；{rerank_notice}" if rerank_notice else "")
+            + (f"；{generation_notice}" if generation_notice else ""),
         )
         return {
             "answer": answer, "sources": sources, "record_id": record_id,
             "confidence": confidence, "model": self.llm_model,
             "retrieval_mode": retrieval_mode, "rerank_used": use_rerank,
+            "resolved_question": resolved_question,
             "rerank_notice": rerank_notice,
+            "generation_notice": generation_notice,
         }
+
+    def evaluate_retrieval(
+        self,
+        actor: dict[str, str],
+        cases: list[dict[str, Any]],
+        retrieval_mode: str = "hybrid",
+        use_rerank: bool = False,
+    ) -> dict[str, Any]:
+        """用人工标注的问题与期望来源评测真实检索链路，不调用生成模型。"""
+        self._role(actor)
+        if retrieval_mode not in {"vector", "bm25", "hybrid"}:
+            raise ValueError("未知检索模式。")
+        clean_cases = [case for case in cases if str(case.get("question", "")).strip()]
+        if not clean_cases:
+            raise ValueError("请至少填写一条评测问题。")
+        if len(clean_cases) > 100:
+            raise ValueError("单次最多评测 100 条问题。")
+
+        details = []
+        for case in clean_cases:
+            question = str(case["question"]).strip()[:500]
+            expected_source = str(case.get("expected_source", "")).strip()
+            expected_page_raw = case.get("expected_page")
+            try:
+                expected_page = int(expected_page_raw) if str(expected_page_raw or "").strip() else None
+            except (TypeError, ValueError):
+                expected_page = None
+            should_answer = bool(case.get("should_answer", True))
+            started = time.perf_counter()
+            error = ""
+            entries = []
+            try:
+                result = self.retrieve(
+                    actor, question, top_k=3,
+                    retrieval_mode=retrieval_mode, use_rerank=use_rerank,
+                )
+                entries = result["entries"]
+            except Exception as exc:
+                error = str(exc)
+            latency = (time.perf_counter() - started) * 1000
+            sources = [
+                {
+                    "source": entry["doc"].metadata.get("source", ""),
+                    "page": entry["doc"].metadata.get("page"),
+                    "confidence": entry.get("confidence", 0),
+                }
+                for entry in entries
+            ]
+            rank = None
+            if expected_source:
+                for index, source in enumerate(sources, start=1):
+                    if source["source"] != expected_source:
+                        continue
+                    if expected_page is not None and source["page"] != expected_page:
+                        continue
+                    rank = index
+                    break
+            refused = not sources
+            details.append({
+                "question": question,
+                "expected_source": expected_source,
+                "expected_page": expected_page,
+                "should_answer": should_answer,
+                "rank": rank,
+                "hit_1": rank == 1,
+                "hit_3": rank is not None and rank <= 3,
+                "reciprocal_rank": 1.0 / rank if rank else 0.0,
+                "refusal_correct": (not should_answer and refused),
+                "latency_ms": round(latency, 1),
+                "sources": sources,
+                "error": error,
+            })
+
+        answer_cases = [item for item in details if item["should_answer"]]
+        refusal_cases = [item for item in details if not item["should_answer"]]
+
+        def average(values: list[float]) -> float:
+            return sum(values) / len(values) if values else 0.0
+
+        summary = {
+            "case_count": len(details),
+            "answer_case_count": len(answer_cases),
+            "refusal_case_count": len(refusal_cases),
+            "recall_1": average([float(item["hit_1"]) for item in answer_cases]),
+            "recall_3": average([float(item["hit_3"]) for item in answer_cases]),
+            "mrr": average([float(item["reciprocal_rank"]) for item in answer_cases]),
+            "refusal_accuracy": average([
+                float(item["refusal_correct"]) for item in refusal_cases
+            ]),
+            "avg_latency_ms": average([float(item["latency_ms"]) for item in details]),
+        }
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO evaluation_runs"
+                " (created_at, username, retrieval_mode, rerank_used, case_count,"
+                " recall_1, recall_3, mrr, refusal_accuracy, avg_latency_ms, details_json)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (self._now(), actor["username"], retrieval_mode, int(use_rerank),
+                 summary["case_count"], summary["recall_1"], summary["recall_3"],
+                 summary["mrr"], summary["refusal_accuracy"], summary["avg_latency_ms"],
+                 json.dumps(details, ensure_ascii=False)),
+            )
+            run_id = int(cursor.lastrowid)
+        self._audit(actor["username"], actor["role"], "evaluation_run",
+                    str(run_id), f"{retrieval_mode}；{len(details)} 条")
+        return {"run_id": run_id, **summary, "details": details}
+
+    def get_evaluation_runs(
+        self, actor: dict[str, str], limit: int = 30
+    ) -> list[dict[str, Any]]:
+        self._role(actor)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM evaluation_runs WHERE username = ? ORDER BY id DESC LIMIT ?",
+                (actor["username"], max(1, min(int(limit), 100))),
+            ).fetchall()
+        return [{
+            "id": row["id"], "created_at": row["created_at"],
+            "retrieval_mode": row["retrieval_mode"],
+            "rerank_used": bool(row["rerank_used"]), "case_count": row["case_count"],
+            "recall_1": row["recall_1"], "recall_3": row["recall_3"],
+            "mrr": row["mrr"], "refusal_accuracy": row["refusal_accuracy"],
+            "avg_latency_ms": row["avg_latency_ms"],
+            "details": json.loads(row["details_json"]),
+        } for row in rows]
+
+    def run_diagnostics(self, actor: dict[str, str]) -> list[dict[str, str]]:
+        """非破坏性检查权限边界、索引元数据、残留向量和两路检索可用性。"""
+        self._require_admin(actor)
+        checks: list[dict[str, str]] = []
+
+        def add(name: str, status: str, detail: str) -> None:
+            checks.append({"检查项": name, "结果": status, "说明": detail})
+
+        expected = {
+            "student": ("student",),
+            "counselor": ("student", "counselor"),
+            "admin": ("student", "counselor", "admin"),
+        }
+        add("角色权限矩阵", "通过" if ROLE_ACCESS == expected else "失败",
+            "学生、辅导员、管理员的知识库边界符合预设。")
+
+        try:
+            self._allowed_groups({"username": "invalid", "role": "invalid"})
+            add("非法角色拦截", "失败", "非法角色未被拒绝。")
+        except PermissionError:
+            add("非法角色拦截", "通过", "无效登录角色会被核心层拒绝。")
+
+        documents = self.list_documents(actor)
+        protected = next(
+            (doc for doc in documents if doc["group"] in {"counselor", "admin"}), None
+        )
+        if protected:
+            try:
+                self.open_source(
+                    {"username": "permission_probe", "role": "student"},
+                    protected["group"], protected["filename"], protected.get("page"),
+                )
+                add("学生越权读取拦截", "失败", "学生读取了不应访问的文档。")
+            except PermissionError:
+                add("学生越权读取拦截", "通过",
+                    f"已验证学生不能读取{protected['group_name']}。")
+            except Exception as exc:
+                add("学生越权读取拦截", "失败", f"检查发生异常：{exc}")
+        else:
+            add("学生越权读取拦截", "跳过", "暂无辅导员或管理员文档可供验证。")
+
+        if protected:
+            try:
+                protected_chunks = [
+                    doc for doc in self._group_chunks(protected["group"])
+                    if doc.metadata.get("source") == protected["filename"]
+                ]
+                probe_tokens = (
+                    self._tokens(protected_chunks[0].page_content)[:6]
+                    if protected_chunks else []
+                )
+                if not probe_tokens:
+                    add("学生越权检索拦截", "跳过", "受保护文档没有可用的测试关键词。")
+                else:
+                    probe = " ".join(probe_tokens)
+                    result = self.retrieve(
+                        {"username": "permission_probe", "role": "student"},
+                        probe, top_k=6, retrieval_mode="bm25", use_rerank=False,
+                    )
+                    leaked = [
+                        entry for entry in result["entries"]
+                        if entry["doc"].metadata.get("group") in {"counselor", "admin"}
+                    ]
+                    add("学生越权检索拦截", "失败" if leaked else "通过",
+                        "学生检索结果出现受保护分组。" if leaked else
+                        "使用受保护文档关键词实测，学生结果中没有受保护分组。")
+            except Exception as exc:
+                add("学生越权检索拦截", "失败", f"实际检索检查异常：{exc}")
+
+        for group in GROUPS:
+            try:
+                chunks = self._group_chunks(group)
+                wrong_group = [doc for doc in chunks if doc.metadata.get("group") != group]
+                missing = sorted({
+                    str(doc.metadata.get("source", "")) for doc in chunks
+                    if not (self.data_dir / GROUPS[group] / str(doc.metadata.get("source", ""))).is_file()
+                })
+                if wrong_group:
+                    add(f"{GROUPS[group]}分组隔离", "失败", "发现跨分组元数据。")
+                elif missing:
+                    add(f"{GROUPS[group]}残留向量", "失败",
+                        "原文件已缺失：" + "、".join(missing[:5]))
+                else:
+                    add(f"{GROUPS[group]}索引一致性", "通过",
+                        f"{len(chunks)} 个切片，未发现跨组或原文件缺失。")
+                if chunks:
+                    probe_tokens = self._tokens(chunks[0].page_content)[:6]
+                    probe = " ".join(probe_tokens) or chunks[0].page_content[:30]
+                    self._vectorstore(group).similarity_search_with_score(probe, k=1)
+                    if probe_tokens:
+                        self._keyword_candidates(group, probe, 3)
+                    add(f"{GROUPS[group]}双路检索", "通过",
+                        "已使用当前文档内容实测向量与关键词查找。")
+            except Exception as exc:
+                add(f"{GROUPS[group]}检索检查", "失败", str(exc))
+        self._audit(actor["username"], actor["role"], "diagnostics", "system",
+                    f"通过 {sum(c['结果'] == '通过' for c in checks)}/{len(checks)} 项")
+        return checks
 
     def open_source(
         self,
@@ -990,7 +1525,7 @@ class CampusRAG:
             self._audit(actor.get("username", "?"), actor.get("role", "?"),
                         "access_denied", f"{group}/{filename}", "越权读取原文")
             raise PermissionError("当前角色无权查看该来源文档。")
-        documents = self._load_file(group, filename)
+        documents = self._load_file(group, filename, use_ocr=True)
         if page is not None:
             pages = [d for d in documents if d.metadata.get("page") == page]
             if not pages:
@@ -1021,6 +1556,7 @@ class CampusRAG:
                 "id": row["id"],
                 "created_at": row["created_at"],
                 "question": row["question"],
+                "resolved_question": row["resolved_question"] or row["question"],
                 "answer": row["answer"],
                 "sources": json.loads(row["sources_json"]),
                 "confidence": int(row["confidence"]),
