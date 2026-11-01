@@ -112,7 +112,14 @@ class CampusRAG:
         self.reranker_model = reranker_model
         self._reranker: Any = None
         self.embeddings = OllamaEmbeddings(model=embedding_model, base_url=ollama_base_url)
-        self.llm = OllamaLLM(model=llm_model, base_url=ollama_base_url, temperature=0.1)
+        self.llm = OllamaLLM(
+            model=llm_model,
+            base_url=ollama_base_url,
+            temperature=0.1,
+            top_p=0.8,
+            repeat_penalty=1.15,
+            num_predict=450,
+        )
         self.splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
@@ -720,6 +727,60 @@ class CampusRAG:
             entry["rerank_score"] = float(score)
         return sorted(entries, key=lambda item: item["rerank_score"], reverse=True)
 
+    @staticmethod
+    def clean_answer(answer: str) -> str:
+        """清理小模型常见的循环短语、重复行和超长输出，也用于旧记录展示。"""
+        text = str(answer).replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not text:
+            return "模型未返回有效内容，请重新提问。"
+
+        # 连续重复的短语可能跨越标点，例如“学校最终评审确定。”被循环输出。
+        for _ in range(8):
+            collapsed = re.sub(r"(.{4,120}?)\1{1,}", r"\1", text, flags=re.S)
+            if collapsed == text:
+                break
+            text = collapsed
+
+        lines: list[str] = []
+        previous = ""
+        for line in text.split("\n"):
+            line = line.strip()
+            if line and line == previous:
+                continue
+            lines.append(line)
+            previous = line
+        text = "\n".join(lines).strip()
+
+        # 最后一道长度保护，优先在完整句号处结束，避免前端渲染超长异常文本。
+        if len(text) > 900:
+            shortened = text[:900]
+            end = max(shortened.rfind(mark) for mark in ("。", "！", "？", "\n"))
+            text = shortened[:end + 1] if end >= 450 else shortened.rstrip() + "……"
+        return text.strip()
+
+    @staticmethod
+    def _fallback_answer(question: str, sources: list[dict[str, Any]]) -> str:
+        """指令模型输出失控时，退回为严格来自证据句的简明摘要。"""
+        topic = re.sub(r"\s+", " ", question).strip()[:60]
+        points = []
+        for source in sources[:4]:
+            evidence = CampusRAG.clean_answer(
+                source.get("evidence") or source.get("content") or ""
+            )
+            evidence = re.sub(r"\s+", " ", evidence).strip()
+            if len(evidence) > 180:
+                shortened = evidence[:180]
+                end = max(shortened.rfind(mark) for mark in ("。", "；", "！"))
+                evidence = shortened[:end + 1] if end >= 60 else shortened.rstrip() + "……"
+            if evidence:
+                points.append(f"{len(points) + 1}. {evidence}[资料{source['id']}]")
+        if not points:
+            return "未从命中文档中提取到可展示的规定，请打开来源原文核对。"
+        return (
+            f"**一句话结论**：以下是资料中与“{topic}”最直接相关的内容。\n\n"
+            "**具体要点**：\n" + "\n".join(points)
+        )
+
     def ask(
         self,
         actor: dict[str, str],
@@ -852,7 +913,11 @@ class CampusRAG:
                 group = str(doc.metadata["group"])
                 evidence, highlight, matched = self._evidence(doc, question)
                 label = f"{GROUPS[group]}/{doc.metadata['source']}{location}"
-                blocks.append(f"[资料{index}] 来源：{label}\n{doc.page_content.strip()}")
+                blocks.append(
+                    f"[资料{index}] 来源：{label}\n"
+                    f"关键句：{evidence}\n"
+                    f"上下文：{doc.page_content.strip()}"
+                )
                 sources.append({
                     "id": index, "group": group, "group_name": GROUPS[group],
                     "source": doc.metadata["source"], "page": page,
@@ -860,21 +925,33 @@ class CampusRAG:
                     "evidence": evidence, "highlight": highlight, "matched": matched,
                     "confidence": entry["confidence"],
                 })
-            prompt = f"""你是“校务通”校园教务问答助手。请在严格依据资料的前提下，把制度原文总结成普通学生能立即看懂的回答。
+            prompt = f"""你是“校务通”校园教务问答助手。请阅读每份资料的关键句和上下文，把制度原文总结成普通学生能立即看懂的回答。
 回答要求：
-1. 不大段照抄原文，先理解资料，再合并重复含义，用短句说明“能不能办、怎么办、要准备什么”。
-2. 第一行使用“**一句话结论**：”直接回答核心问题。
-3. 接着使用“**具体要点**：”，用不超过4条编号短句列出条件、材料、步骤或期限，并在对应句末标注[资料1]等来源。
-4. 如果存在容易误解的限制，最后用“**注意**：”补充一句；没有则不写。
-5. 资料只提到事项但没有所需条件、材料或流程时，明确说缺少哪类信息，不用相近制度替代，也不要编造。
-6. 不重复用户问题，不写“根据以下资料”等过程性套话，不复述这些指令。通常控制在300字内。
+1. 必须直接回答问题，优先提炼资料中已有的条件、比例、材料、步骤、期限和负责主体；不能用“请查阅手册”“可在文档中找到”代替答案。
+2. 先合并相同含义，再用自己的话简洁表达，不大段照抄，不重复任何句子或短语。
+3. 第一行必须写“**一句话结论**：”，直接概括核心答案。
+4. 接着必须写“**具体要点**：”，用不超过4条编号短句列出具体信息，并在对应句末标注[资料1]等来源。
+5. 如果存在容易误解的限制，最后写“**注意**：”并补充一句；没有则不写。
+6. 资料确实没有所需信息时，明确指出缺少的是条件、材料还是流程，不得用相近制度替代或编造。
+7. 不重复用户问题，不复述指令，不写“根据以下资料”等套话。通常控制在300字内，信息完整后立即停止。
 
 用户问题：{question}
 
 资料：
 {chr(10).join(blocks)}
 """
-            answer = str(self.llm.invoke(prompt)).strip()
+            raw_answer = str(self.llm.invoke(prompt)).strip()
+            answer = self.clean_answer(raw_answer)
+            severely_repeated = (
+                len(raw_answer) >= 160 and len(answer) <= len(raw_answer) * 0.55
+            )
+            if (
+                not raw_answer
+                or severely_repeated
+                or "一句话结论" not in answer
+                or "具体要点" not in answer
+            ):
+                answer = self._fallback_answer(question, sources)
             values = [entry["confidence"] for entry in selected_entries]
             confidence = round(0.6 * max(values) + 0.4 * sum(values) / len(values))
 

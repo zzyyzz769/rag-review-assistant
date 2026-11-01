@@ -88,9 +88,11 @@ with st.sidebar:
     with st.expander("本地模型设置"):
         llm_model = st.selectbox(
             "Qwen 生成模型",
-            ["qwen:1.8b", "qwen2.5:3b"],
-            index=1,
+            ["qwen2.5:3b", "qwen:1.8b"],
+            index=0,
         )
+        if llm_model == "qwen:1.8b":
+            st.caption("qwen:1.8b 更容易重复或漏答，建议使用 qwen2.5:3b。")
         embedding_model = st.text_input("嵌入模型", value="bge-m3")
         base_url = st.text_input("Ollama 地址", value="http://localhost:11434")
         st.caption("更换嵌入模型后，需要重新向量化全部现有文档。")
@@ -271,7 +273,7 @@ with tabs[0]:
             st.markdown(record["question"])
         with st.chat_message("assistant"):
             show_answer_meta(record)
-            st.markdown(record["answer"])
+            st.markdown(rag.clean_answer(record["answer"]))
             show_sources(record["sources"], int(record["id"]))
 
     question = st.chat_input("请输入要查询的教务制度、办理条件或流程")
@@ -315,7 +317,7 @@ with tabs[2]:
                 f"置信度 {version.get('confidence', 0)}"
             )
             with st.expander(title, expanded=len(versions) == 1):
-                st.markdown(version["answer"])
+                st.markdown(rag.clean_answer(version["answer"]))
                 st.caption(
                     "Rerank：" + ("开启" if version.get("rerank_used") else "关闭")
                     + "；反馈：" + (version.get("feedback") or "未反馈")
